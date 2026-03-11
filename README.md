@@ -16,15 +16,16 @@ Claude Code session logger with two-tier knowledge base. Logs sessions to a priv
 ### Personal (with Obsidian vault)
 
 ```bash
-GITHUB_PAT=ghp_xxx VAULT_PATH=~/obsidian-vault \
-  curl -sL https://raw.githubusercontent.com/Lukasvd123/claude-logger/main/install.sh | bash -s -- --mode=personal
+export GITHUB_PAT=ghp_xxx
+export VAULT_PATH=~/obsidian-vault
+curl -sL https://raw.githubusercontent.com/Lukasvd123/claude-logger/main/install.sh | bash -s -- --mode=personal
 ```
 
 ### Server (hooks only, nothing persists)
 
 ```bash
-GITHUB_PAT=ghp_xxx \
-  curl -sL https://raw.githubusercontent.com/Lukasvd123/claude-logger/main/install.sh | bash -s -- --mode=server
+export GITHUB_PAT=ghp_xxx
+curl -sL https://raw.githubusercontent.com/Lukasvd123/claude-logger/main/install.sh | bash -s -- --mode=server
 ```
 
 ### Windows (personal only)

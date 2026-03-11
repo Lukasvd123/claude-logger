@@ -21,12 +21,14 @@ for arg in "$@"; do
     case "$arg" in
         --mode=personal) MODE="personal" ;;
         --mode=server)   MODE="server" ;;
+        GITHUB_PAT=*)    export GITHUB_PAT="${arg#GITHUB_PAT=}" ;;
+        VAULT_PATH=*)    export VAULT_PATH="${arg#VAULT_PATH=}" ;;
     esac
 done
 [ -z "$MODE" ] && error "Usage: install.sh --mode=personal|server"
 
 # --- Validate env vars ---
-[ -z "${GITHUB_PAT:-}" ] && error "GITHUB_PAT is required"
+[ -z "${GITHUB_PAT:-}" ] && error "GITHUB_PAT is required. Use: export GITHUB_PAT=xxx before running, or pass as arg."
 if [ "$MODE" = "personal" ]; then
     [ -z "${VAULT_PATH:-}" ] && error "VAULT_PATH is required for personal mode"
 fi
