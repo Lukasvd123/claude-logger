@@ -68,8 +68,13 @@ function clearBuffer() {
 
 function claudeCall(prompt, timeoutMs = 60000) {
     return new Promise((resolve, reject) => {
+        // Build clean env: remove Claude Code nesting guards, keep auth via config/keyring
+        const env = { ...process.env, CLAUDELOGS_INTERNAL: '1' };
+        for (const key of Object.keys(env)) {
+            if (key.startsWith('CLAUDE') && key !== 'CLAUDELOGS_INTERNAL') delete env[key];
+        }
         const proc = spawn('claude', ['-p', '--model', 'haiku'], {
-            env: { ...process.env, CLAUDELOGS_INTERNAL: '1' },
+            env,
             stdio: ['pipe', 'pipe', 'pipe'],
         });
         let stdout = '';
@@ -112,13 +117,15 @@ function setupServerRepo() {
     const staging = `/tmp/claudelogs-staging-${SESSION_ID}`;
     if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
     const url = `https://${REPO_OWNER}:${GITHUB_PAT}@github.com/${REPO_OWNER}/${REPO_NAME}.git`;
-    execSync(`git clone --depth 1 "${url}" "${staging}"`, {
+    execSync(`git -c "credential.https://github.com.helper=" clone --depth 1 "${url}" "${staging}"`, {
         stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000,
     });
     return staging;
 }
 
 function commitAndPush(writeDir, message) {
+    // Use -c credential.helper= to bypass gh auth and use the PAT in the remote URL
+    const g = 'git -c "credential.https://github.com.helper="';
     const opts = { cwd: writeDir, stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000, encoding: 'utf8' };
     const maxRetries = 3;
 
@@ -133,15 +140,15 @@ function commitAndPush(writeDir, message) {
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            execSync('git push', opts);
+            execSync(`${g} push`, opts);
             return;
         } catch (err) {
             if (attempt === maxRetries) {
                 throw new Error(`git push failed after ${maxRetries} attempts: ${err.message}`);
             }
-            try { execSync('git pull --rebase', opts); } catch {
+            try { execSync(`${g} pull --rebase`, opts); } catch {
                 try { execSync('git rebase --abort', opts); } catch {}
-                execSync('git pull --rebase', opts);
+                execSync(`${g} pull --rebase`, opts);
             }
         }
     }

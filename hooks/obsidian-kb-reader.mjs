@@ -59,8 +59,12 @@ function localReadFile(filePath) {
 
 function claudeCall(prompt, timeoutMs = 4000) {
     return new Promise((resolve, reject) => {
+        const env = { ...process.env, CLAUDELOGS_INTERNAL: '1' };
+        for (const key of Object.keys(env)) {
+            if (key.startsWith('CLAUDE') && key !== 'CLAUDELOGS_INTERNAL') delete env[key];
+        }
         const proc = spawn('claude', ['-p', '--model', 'haiku'], {
-            env: { ...process.env, CLAUDELOGS_INTERNAL: '1' },
+            env,
             stdio: ['pipe', 'pipe', 'pipe'],
         });
         let stdout = '';
