@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "command": "bash $HOME/.claude/hooks/buffer-action.sh"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "bash $HOME/.claude/hooks/session-end.sh"
+      }
+    ]
+  }
+}
