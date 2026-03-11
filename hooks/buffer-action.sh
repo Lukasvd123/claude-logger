@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # buffer-action.sh — PostToolUse hook
 # Appends structured JSON lines to a per-session buffer
+# ALL output suppressed — never leak to terminal
 
 # Guard: skip if this is an internal claude call from the logger
 [ "${CLAUDELOGS_INTERNAL:-}" = "1" ] && exit 0
@@ -57,9 +58,9 @@
         BUFFER_LINES=$(wc -l < "$BUFFER" 2>/dev/null || echo 0)
         if [ "$CWD" != "$LAST_CWD" ] && [ "$BUFFER_LINES" -ge 3 ]; then
             HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
-            CLAUDELOGS_INTERNAL=1 node "$HOOKS_DIR/obsidian-logger.mjs" --trigger mid-session --session-id "$SESSION_ID" >> /tmp/claudelogs-errors.log 2>&1 &
+            CLAUDELOGS_INTERNAL=1 node "$HOOKS_DIR/obsidian-logger.mjs" --trigger mid-session --session-id "$SESSION_ID" &
         fi
     fi
     echo "$CWD" > "$LAST_CWD_FILE"
 
-} 2>> /tmp/claudelogs-errors.log || true
+} >> /tmp/claudelogs-errors.log 2>&1 || true
