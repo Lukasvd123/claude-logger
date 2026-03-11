@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 // obsidian-logger.mjs — Write-time processor for Claude Code session logs
-// 4 destinations: dev-log, time-log, knowledge-base, diff-summaries
-// All run in parallel. Buffer cleared only after all writes + push succeed.
+// Uses `claude -p` (local CLI) instead of direct API calls — works with OAuth subscriptions.
+// Single batched call for all processing. Buffer cleared only after all writes + push succeed.
 
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, rmSync } from 'fs';
 import { join, basename } from 'path';
 
 const GITHUB_PAT = process.env.GITHUB_PAT;
 const VAULT_PATH = process.env.VAULT_PATH;
-const API_KEY = process.env.ANTHROPIC_API_KEY;
 const MODE = VAULT_PATH ? 'personal' : 'server';
 const REPO_OWNER = 'Lukasvd123';
 const REPO_NAME = 'Claudelogs';
@@ -28,13 +27,12 @@ const SESSION_ID = getArg('session-id') || 'unknown';
 
 // --- Helpers ---
 
-function timestamp() {
+function ts() {
     return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
 function logError(msg) {
-    const line = `[${timestamp()}] ${msg}\n`;
-    try { writeFileSync('/tmp/claudelogs-errors.log', line, { flag: 'a' }); } catch {}
+    try { writeFileSync('/tmp/claudelogs-errors.log', `[${ts()}] ${msg}\n`, { flag: 'a' }); } catch {}
 }
 
 function getProjectSlug() {
@@ -66,34 +64,41 @@ function clearBuffer() {
     try { unlinkSync(`/tmp/claude-session-${SESSION_ID}.jsonl`); } catch {}
 }
 
-async function anthropicCall(prompt, { maxTokens = 1024, system } = {}) {
-    if (!API_KEY) throw new Error('No ANTHROPIC_API_KEY');
-    const body = {
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: maxTokens,
-        messages: [{ role: 'user', content: prompt }],
-    };
-    if (system) body.system = system;
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-            'x-api-key': API_KEY,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
-        },
-        body: JSON.stringify(body),
+// --- Claude CLI call (uses OAuth subscription, no API key needed) ---
+
+function claudeCall(prompt, timeoutMs = 60000) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn('claude', ['-p', '--model', 'haiku'], {
+            env: { ...process.env, CLAUDELOGS_INTERNAL: '1' },
+            stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout.on('data', d => { stdout += d; });
+        proc.stderr.on('data', d => { stderr += d; });
+        proc.stdin.write(prompt);
+        proc.stdin.end();
+        const timer = setTimeout(() => {
+            proc.kill();
+            reject(new Error('claude -p timed out'));
+        }, timeoutMs);
+        proc.on('close', code => {
+            clearTimeout(timer);
+            if (code === 0) resolve(stdout.trim());
+            else reject(new Error(`claude exited ${code}: ${stderr.slice(0, 200)}`));
+        });
+        proc.on('error', err => {
+            clearTimeout(timer);
+            reject(err);
+        });
     });
-    if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`Anthropic API ${resp.status}: ${text.slice(0, 200)}`);
-    }
-    const data = await resp.json();
-    return data.content?.[0]?.text || '';
 }
 
 function parseJSON(text) {
-    const match = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
-    try { return JSON.parse(match[1].trim()); } catch { return null; }
+    // Try to extract JSON from markdown code blocks or raw text
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    const toParse = fenced ? fenced[1].trim() : text.trim();
+    try { return JSON.parse(toParse); } catch { return null; }
 }
 
 // --- Git operations ---
@@ -119,10 +124,9 @@ function commitAndPush(writeDir, message) {
 
     execSync('git add .', opts);
 
-    // Check if there's anything to commit
     try {
         const status = execSync('git status --porcelain', opts).trim();
-        if (!status) return; // nothing to commit
+        if (!status) return;
     } catch {}
 
     execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, opts);
@@ -130,16 +134,12 @@ function commitAndPush(writeDir, message) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             execSync('git push', opts);
-            return; // success
+            return;
         } catch (err) {
             if (attempt === maxRetries) {
                 throw new Error(`git push failed after ${maxRetries} attempts: ${err.message}`);
             }
-            // Pull rebase and retry
-            try {
-                execSync('git pull --rebase', opts);
-            } catch (pullErr) {
-                // If rebase fails, abort and retry fresh
+            try { execSync('git pull --rebase', opts); } catch {
                 try { execSync('git rebase --abort', opts); } catch {}
                 execSync('git pull --rebase', opts);
             }
@@ -157,7 +157,7 @@ function ensureDir(dir) {
     mkdirSync(dir, { recursive: true });
 }
 
-// --- Dedup: check existing filenames ---
+// --- Dedup KB ---
 
 async function existingKBFiles(tier, slug) {
     const names = new Set();
@@ -196,53 +196,82 @@ function isDuplicate(existingNames, newTitle) {
     return false;
 }
 
-// --- Destination 1: Dev Log ---
+// --- Single batched analysis call ---
 
-async function writeDevLog(buffer, writeDir, projectSlug) {
-    const hostname = buffer[0]?.hostname || 'unknown';
-    const firstTs = buffer[0]?.timestamp || new Date().toISOString();
-    const lastTs = buffer[buffer.length - 1]?.timestamp || firstTs;
-    const dateStr = firstTs.slice(0, 10);
+async function analyzeSession(buffer, projectSlug) {
+    const hasGitOps = buffer.some(b => b.action_type === 'git_op');
 
     const bufferSummary = buffer.map(b =>
         `[${b.timestamp}] ${b.tool_name} (${b.action_type}): ${b.extra || b.tool_input_preview}`
     ).join('\n');
 
-    const prompt = `Analyze this Claude Code session log and return JSON with these fields:
-- category: one of [feature, bugfix, refactor, config, devops, research, docs, setup, other]
-- kebab_title: short kebab-case title (max 6 words)
-- what_was_asked: one sentence
-- what_was_done: array of short bullet strings
-- files_written: array of {path, machine} objects
-- permission_changes: array of strings (empty if none)
-- fs_ops: array of strings (empty if none)
-- folders_used: array of unique directory paths
-- tags: array of relevant tags
-- duration_minutes: estimated from timestamps
+    const prompt = `You are a structured log analyzer. Analyze this Claude Code session buffer and return a single JSON object. No explanation, no markdown fences, just valid JSON.
 
-Session buffer:
-${bufferSummary}
+{
+  "dev_log": {
+    "category": "one of: feature, bugfix, refactor, config, devops, research, docs, setup, other",
+    "kebab_title": "short-kebab-title-max-6-words",
+    "what_was_asked": "one sentence summary of what the user wanted",
+    "what_was_done": ["bullet 1", "bullet 2"],
+    "files_written": [{"path": "/full/path", "machine": "hostname"}],
+    "permission_changes": [],
+    "fs_ops": [],
+    "folders_used": ["/unique/dirs"],
+    "tags": ["relevant", "tags"],
+    "duration_minutes": 0
+  },
+  "kb_entries": [
+    {
+      "summary": "one-line problem description",
+      "fix": "one-line fix description",
+      "type": "solution or failure",
+      "tier": "tier1 if generic (tool failures, Linux quirks, shell gotchas, not repo-specific) or tier2 if project-specific"
+    }
+  ],
+  "diff_summaries": [
+    {
+      "command": "the git command",
+      "bullets": ["changelog bullet 1", "changelog bullet 2"]
+    }
+  ]
+}
 
-Respond with valid JSON only.`;
+Rules:
+- kb_entries: only genuinely reusable insights. Empty array if nothing worth logging.
+- diff_summaries: only for git operations (commit/push/merge).${hasGitOps ? '' : ' Empty array — no git ops in this session.'}
+- duration_minutes: estimate from first to last timestamp.
+- Respond with ONLY the JSON object, nothing else.
 
-    const result = parseJSON(await anthropicCall(prompt, { maxTokens: 1500 }));
-    if (!result) return null;
+Session buffer (project: ${projectSlug}):
+${bufferSummary}`;
 
-    const title = result.kebab_title || 'untitled';
-    const category = result.category || 'other';
+    const raw = await claudeCall(prompt, 90000);
+    return parseJSON(raw);
+}
+
+// --- Write destinations ---
+
+function writeDevLog(analysis, buffer, writeDir, projectSlug) {
+    const d = analysis.dev_log;
+    if (!d) return null;
+
+    const hostname = buffer[0]?.hostname || 'unknown';
+    const firstTs = buffer[0]?.timestamp || new Date().toISOString();
+    const dateStr = firstTs.slice(0, 10);
+    const startTime = firstTs.slice(11, 16);
+
+    const title = d.kebab_title || 'untitled';
+    const category = d.category || 'other';
     const filename = `${dateStr}-${title}.md`;
     const dir = join(writeDir, LOGS_BASE, 'dev-logs', category);
     ensureDir(dir);
-
-    const startTime = firstTs.slice(11, 16);
-    const duration = result.duration_minutes || '?';
 
     const frontmatter = [
         '---',
         `date: ${dateStr}`,
         `machine: ${hostname}`,
-        `duration: ~${duration}min`,
-        `tags: [${(result.tags || []).join(', ')}]`,
+        `duration: ~${d.duration_minutes || '?'}min`,
+        `tags: [${(d.tags || []).join(', ')}]`,
         `trigger: ${TRIGGER}`,
         `project: ${projectSlug}`,
         '---',
@@ -251,30 +280,25 @@ Respond with valid JSON only.`;
     const body = [
         `# ${title.replace(/-/g, ' ')}`,
         '',
-        `**Asked:** ${result.what_was_asked || 'N/A'}`,
+        `**Asked:** ${d.what_was_asked || 'N/A'}`,
         '',
         '**Done:**',
-        ...(result.what_was_done || []).map(d => `- ${d}`),
+        ...(d.what_was_done || []).map(x => `- ${x}`),
         '',
         '**Files:**',
-        ...(result.files_written || []).map(f => `- \`${f.path}\` (${f.machine || hostname})`),
+        ...(d.files_written || []).map(f => `- \`${f.path}\` (${f.machine || hostname})`),
     ];
 
-    if (result.permission_changes?.length) {
-        body.push('', '**Permission changes:**', ...result.permission_changes.map(p => `- ${p}`));
-    }
-    if (result.fs_ops?.length) {
-        body.push('', '**FS operations:**', ...result.fs_ops.map(f => `- ${f}`));
-    }
-    if (result.folders_used?.length) {
-        body.push('', '**Directories:**', ...result.folders_used.map(f => `- \`${f}\``));
-    }
+    if (d.permission_changes?.length)
+        body.push('', '**Permission changes:**', ...d.permission_changes.map(p => `- ${p}`));
+    if (d.fs_ops?.length)
+        body.push('', '**FS operations:**', ...d.fs_ops.map(f => `- ${f}`));
+    if (d.folders_used?.length)
+        body.push('', '**Directories:**', ...d.folders_used.map(f => `- \`${f}\``));
 
     writeFileSync(join(dir, filename), `${frontmatter}\n\n${body.join('\n')}\n`);
-    return { title, category, duration, startTime };
+    return { title, category, duration: d.duration_minutes, startTime };
 }
-
-// --- Destination 2: Time Log ---
 
 function writeTimeLog(buffer, writeDir, projectSlug, devLogResult) {
     const firstTs = buffer[0]?.timestamp || new Date().toISOString();
@@ -296,48 +320,13 @@ function writeTimeLog(buffer, writeDir, projectSlug, devLogResult) {
         content = `# Time Log — ${monthStr}\n\n| Date | Time | Machine | Duration | Topic | Project |\n|------|------|---------|----------|-------|---------|\n`;
     }
 
-    const row = `| ${dateStr} | ${startTime} | ${hostname} | ~${duration}min | ${topic} | ${projectSlug} |`;
-    content += `${row}\n`;
+    content += `| ${dateStr} | ${startTime} | ${hostname} | ~${duration}min | ${topic} | ${projectSlug} |\n`;
     writeFileSync(file, content);
 }
 
-// --- Destination 3: Knowledge Base ---
-
-async function writeKnowledgeBase(buffer, writeDir, projectSlug) {
-    const bufferSummary = buffer.map(b =>
-        `[${b.timestamp}] ${b.tool_name} (${b.action_type}): ${b.extra || b.tool_input_preview}`
-    ).join('\n');
-
-    const extractPrompt = `Analyze this Claude Code session log. Extract any reusable solutions (things that worked) and failures (things that didn't work and the fix). Return JSON:
-{
-  "solutions": [{"summary": "one-line problem", "fix": "one-line fix"}],
-  "failures": [{"summary": "one-line problem", "fix": "one-line fix"}]
-}
-Return empty arrays if nothing worth logging. Only extract genuinely reusable insights.
-
-Session log:
-${bufferSummary}
-
-Respond with valid JSON only.`;
-
-    const extracted = parseJSON(await anthropicCall(extractPrompt, { maxTokens: 1000 }));
-    if (!extracted) return;
-
-    const allEntries = [
-        ...(extracted.solutions || []).map(s => ({ ...s, type: 'solution' })),
-        ...(extracted.failures || []).map(f => ({ ...f, type: 'failure' })),
-    ];
-    if (allEntries.length === 0) return;
-
-    const classifyPrompt = `For each entry below, classify as "tier1" (generic — tool failures, Linux quirks, shell/env gotchas, recurring habits, not tied to any specific repo) or "tier2" (project-specific — bugs, domain config, errors tied to a particular codebase). Return JSON array of objects with index and tier.
-
-Entries:
-${allEntries.map((e, i) => `[${i}] ${e.type}: ${e.summary} → ${e.fix}`).join('\n')}
-
-Respond with valid JSON only, e.g. [{"index":0,"tier":"tier1"},{"index":1,"tier":"tier2"}]`;
-
-    const classifications = parseJSON(await anthropicCall(classifyPrompt, { maxTokens: 500 }));
-    if (!Array.isArray(classifications)) return;
+async function writeKnowledgeBase(analysis, writeDir, projectSlug) {
+    const entries = analysis.kb_entries || [];
+    if (entries.length === 0) return;
 
     const dateStr = new Date().toISOString().slice(0, 10);
     const [existingTier1, existingTier2] = await Promise.all([
@@ -345,11 +334,9 @@ Respond with valid JSON only, e.g. [{"index":0,"tier":"tier1"},{"index":1,"tier"
         existingKBFiles('tier2', projectSlug),
     ]);
 
-    for (const cls of classifications) {
-        const entry = allEntries[cls.index];
-        if (!entry) continue;
-        const tier = cls.tier === 'tier1' ? 'tier1' : 'tier2';
-        const slug = entry.summary
+    for (const entry of entries) {
+        const tier = entry.tier === 'tier1' ? 'tier1' : 'tier2';
+        const slug = (entry.summary || 'untitled')
             .toLowerCase()
             .replace(/[^a-z0-9]+/g, '-')
             .replace(/^-|-$/g, '')
@@ -374,37 +361,17 @@ Respond with valid JSON only, e.g. [{"index":0,"tier":"tier1"},{"index":1,"tier"
     }
 }
 
-// --- Destination 4: Diff Summaries ---
-
-async function writeDiffSummaries(buffer, writeDir, projectSlug) {
-    const gitOps = buffer.filter(b => b.action_type === 'git_op');
-    if (gitOps.length === 0) return;
+function writeDiffSummaries(analysis, buffer, writeDir, projectSlug) {
+    const summaries = analysis.diff_summaries || [];
+    if (summaries.length === 0) return;
 
     const dateStr = new Date().toISOString().slice(0, 10);
     const hostname = buffer[0]?.hostname || 'unknown';
 
-    for (const op of gitOps) {
-        const cmd = op.extra || op.tool_input_preview || '';
-        const prompt = `Given this git command from a Claude Code session, write a 2-3 bullet changelog summary of what likely changed. Be concise.
-
-Command: ${cmd}
-Project: ${projectSlug}
-Machine: ${hostname}
-
-Return a markdown bullet list only.`;
-
-        let summary;
-        try {
-            summary = await anthropicCall(prompt, { maxTokens: 300 });
-        } catch { continue; }
-        if (!summary) continue;
-
-        const slug = cmd
-            .replace(/^git\s+/, '')
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '-')
-            .replace(/^-|-$/g, '')
-            .slice(0, 40);
+    for (const ds of summaries) {
+        const cmd = ds.command || '';
+        const slug = cmd.replace(/^git\s+/, '').toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
 
         const filename = `${dateStr}-${slug}.md`;
         const dir = join(writeDir, LOGS_BASE, 'diff-summaries');
@@ -425,7 +392,8 @@ Return a markdown bullet list only.`;
             '---',
         ].join('\n');
 
-        writeFileSync(join(dir, filename), `${frontmatter}\n\n${summary.trim()}\n`);
+        const bullets = (ds.bullets || []).map(b => `- ${b}`).join('\n');
+        writeFileSync(join(dir, filename), `${frontmatter}\n\n${bullets}\n`);
     }
 }
 
@@ -433,34 +401,28 @@ Return a markdown bullet list only.`;
 
 async function main() {
     const buffer = readBuffer();
-    if (buffer.length === 0) {
-        return;
-    }
+    if (buffer.length === 0) return;
 
     const projectSlug = getProjectSlug();
     const writeDir = getWriteDir();
 
-    // Server mode: clone repo first
-    if (MODE === 'server') {
-        setupServerRepo();
-    }
+    if (MODE === 'server') setupServerRepo();
 
     try {
-        // Dev log runs first so time log can use its result
-        const devLogResult = await writeDevLog(buffer, writeDir, projectSlug);
+        // Single claude call for all analysis
+        const analysis = await analyzeSession(buffer, projectSlug);
+        if (!analysis) throw new Error('Failed to parse analysis from claude');
 
-        // Remaining 3 destinations in parallel
-        await Promise.all([
-            Promise.resolve(writeTimeLog(buffer, writeDir, projectSlug, devLogResult)),
-            writeKnowledgeBase(buffer, writeDir, projectSlug),
-            writeDiffSummaries(buffer, writeDir, projectSlug),
-        ]);
+        // Write all 4 destinations
+        const devLogResult = writeDevLog(analysis, buffer, writeDir, projectSlug);
+        writeTimeLog(buffer, writeDir, projectSlug, devLogResult);
+        await writeKnowledgeBase(analysis, writeDir, projectSlug);
+        writeDiffSummaries(analysis, buffer, writeDir, projectSlug);
 
         // Commit and push with retry
         const dateStr = new Date().toISOString().slice(0, 10);
         commitAndPush(writeDir, `log: ${dateStr} session (${TRIGGER})`);
 
-        // Clear buffer only after successful push
         clearBuffer();
     } catch (err) {
         logError(`Logger failed: ${err.message}`);
