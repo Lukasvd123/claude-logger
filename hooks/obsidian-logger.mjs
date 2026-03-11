@@ -232,7 +232,8 @@ async function analyzeSession(buffer, projectSlug) {
       "summary": "one-line problem description",
       "fix": "one-line fix description",
       "type": "solution or failure",
-      "tier": "tier1 if generic (tool failures, Linux quirks, shell gotchas, not repo-specific) or tier2 if project-specific"
+      "tier": "tier1 if generic (tool failures, Linux quirks, shell gotchas, not repo-specific) or tier2 if project-specific",
+      "tags": ["short", "relevant", "tags", "for-obsidian-search"]
     }
   ],
   "diff_summaries": [
@@ -303,6 +304,10 @@ function writeDevLog(analysis, buffer, writeDir, projectSlug) {
     if (d.folders_used?.length)
         body.push('', '**Directories:**', ...d.folders_used.map(f => `- \`${f}\``));
 
+    // Obsidian: inline tags + wikilink to project for graph view
+    body.push('', `**Project:** [[${projectSlug}]]`);
+    body.push('', (d.tags || []).map(t => `#${t.replace(/\s+/g, '-')}`).join(' ') + ` #${category}`);
+
     writeFileSync(join(dir, filename), `${frontmatter}\n\n${body.join('\n')}\n`);
     return { title, category, duration: d.duration_minutes, startTime };
 }
@@ -353,14 +358,45 @@ async function writeKnowledgeBase(analysis, writeDir, projectSlug) {
         if (isDuplicate(existingNames, slug)) continue;
 
         const filename = `${dateStr}-${slug}.md`;
+        const tags = entry.tags || [];
+        // Add tier and type as tags for Obsidian filtering
+        const allTags = [...new Set([tier, entry.type, ...tags])];
         let dir, content;
 
         if (tier === 'tier1') {
             dir = join(writeDir, LOGS_BASE, 'knowledge-base', 'tier1');
-            content = `**Problem:** ${entry.summary}\n**Fix:** ${entry.fix}\n**Type:** ${entry.type}\n`;
+            content = [
+                '---',
+                `date: ${dateStr}`,
+                `type: ${entry.type}`,
+                `tier: tier1`,
+                `tags: [${allTags.join(', ')}]`,
+                '---',
+                '',
+                `**Problem:** ${entry.summary}`,
+                `**Fix:** ${entry.fix}`,
+                '',
+                `#${entry.type} #tier1 ${tags.map(t => `#${t.replace(/\s+/g, '-')}`).join(' ')}`,
+                '',
+            ].join('\n');
         } else {
             dir = join(writeDir, LOGS_BASE, 'knowledge-base', 'tier2', projectSlug);
-            content = `**Problem:** ${entry.summary}\n**Fix:** ${entry.fix}\n**Type:** ${entry.type}\n**Project:** ${projectSlug}\n`;
+            content = [
+                '---',
+                `date: ${dateStr}`,
+                `type: ${entry.type}`,
+                `tier: tier2`,
+                `project: ${projectSlug}`,
+                `tags: [${allTags.join(', ')}]`,
+                '---',
+                '',
+                `**Problem:** ${entry.summary}`,
+                `**Fix:** ${entry.fix}`,
+                `**Project:** [[${projectSlug}]]`,
+                '',
+                `#${entry.type} #tier2 #${projectSlug} ${tags.map(t => `#${t.replace(/\s+/g, '-')}`).join(' ')}`,
+                '',
+            ].join('\n');
         }
 
         ensureDir(dir);
