@@ -141,8 +141,8 @@ if [ -f "$SETTINGS_FILE" ]; then
     # Merge hooks into existing settings
     EXISTING=$(cat "$SETTINGS_FILE")
     MERGED=$(echo "$EXISTING" | jq --argjson new "$NEW_SETTINGS" '
-        .hooks.PostToolUse = ((.hooks.PostToolUse // []) + $new.hooks.PostToolUse | unique_by(.command)) |
-        .hooks.Stop = ((.hooks.Stop // []) + $new.hooks.Stop | unique_by(.command))
+        .hooks.PostToolUse = ((.hooks.PostToolUse // []) + $new.hooks.PostToolUse | unique_by(.hooks[0].command)) |
+        .hooks.Stop = ((.hooks.Stop // []) + $new.hooks.Stop | unique_by(.hooks[0].command))
     ')
     echo "$MERGED" > "$SETTINGS_FILE"
     warn "Merged hook settings into existing $SETTINGS_FILE"
