@@ -7,7 +7,6 @@ import { execSync } from 'child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, rmSync } from 'fs';
 import { join, basename } from 'path';
 
-
 const GITHUB_PAT = process.env.GITHUB_PAT;
 const VAULT_PATH = process.env.VAULT_PATH;
 const API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -15,9 +14,17 @@ const MODE = VAULT_PATH ? 'personal' : 'server';
 const REPO_OWNER = 'Lukasvd123';
 const REPO_NAME = 'Claudelogs';
 const LOGS_BASE = 'claude-logs';
-const TRIGGER = process.argv.find(a => a.startsWith('--trigger='))?.split('=')[1]
-    || process.argv[process.argv.indexOf('--trigger') + 1]
-    || 'unknown';
+
+function getArg(name) {
+    const idx = process.argv.indexOf(`--${name}`);
+    if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1];
+    const eq = process.argv.find(a => a.startsWith(`--${name}=`));
+    if (eq) return eq.split('=').slice(1).join('=');
+    return null;
+}
+
+const TRIGGER = getArg('trigger') || 'unknown';
+const SESSION_ID = getArg('session-id') || 'unknown';
 
 // --- Helpers ---
 
@@ -41,39 +48,22 @@ function getProjectSlug() {
     return basename(process.cwd()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
 }
 
-function findBufferFiles() {
-    const files = [];
+function readBuffer() {
+    const bufferFile = `/tmp/claude-session-${SESSION_ID}.jsonl`;
+    const lines = [];
     try {
-        const entries = readdirSync('/tmp');
-        for (const e of entries) {
-            if (e.startsWith('claude-session-') && e.endsWith('.jsonl')) {
-                files.push(join('/tmp', e));
+        const content = readFileSync(bufferFile, 'utf8').trim();
+        if (content) {
+            for (const line of content.split('\n')) {
+                try { lines.push(JSON.parse(line)); } catch {}
             }
         }
     } catch {}
-    return files.sort();
-}
-
-function readBuffer() {
-    const files = findBufferFiles();
-    const lines = [];
-    for (const f of files) {
-        try {
-            const content = readFileSync(f, 'utf8').trim();
-            if (content) {
-                for (const line of content.split('\n')) {
-                    try { lines.push(JSON.parse(line)); } catch {}
-                }
-            }
-        } catch {}
-    }
     return lines;
 }
 
 function clearBuffer() {
-    for (const f of findBufferFiles()) {
-        try { unlinkSync(f); } catch {}
-    }
+    try { unlinkSync(`/tmp/claude-session-${SESSION_ID}.jsonl`); } catch {}
 }
 
 async function anthropicCall(prompt, { maxTokens = 1024, system } = {}) {
@@ -102,7 +92,6 @@ async function anthropicCall(prompt, { maxTokens = 1024, system } = {}) {
 }
 
 function parseJSON(text) {
-    // Extract JSON from potential markdown code blocks
     const match = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
     try { return JSON.parse(match[1].trim()); } catch { return null; }
 }
@@ -111,11 +100,11 @@ function parseJSON(text) {
 
 function getWriteDir() {
     if (MODE === 'personal') return VAULT_PATH;
-    return '/tmp/claudelogs-staging';
+    return `/tmp/claudelogs-staging-${SESSION_ID}`;
 }
 
 function setupServerRepo() {
-    const staging = '/tmp/claudelogs-staging';
+    const staging = `/tmp/claudelogs-staging-${SESSION_ID}`;
     if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
     const url = `https://${REPO_OWNER}:${GITHUB_PAT}@github.com/${REPO_OWNER}/${REPO_NAME}.git`;
     execSync(`git clone --depth 1 "${url}" "${staging}"`, {
@@ -125,26 +114,42 @@ function setupServerRepo() {
 }
 
 function commitAndPush(writeDir, message) {
-    const opts = { cwd: writeDir, stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000 };
-    if (MODE === 'personal') {
-        try { execSync('git pull --rebase', opts); } catch {}
-        execSync('git add .', opts);
+    const opts = { cwd: writeDir, stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000, encoding: 'utf8' };
+    const maxRetries = 3;
+
+    execSync('git add .', opts);
+
+    // Check if there's anything to commit
+    try {
+        const status = execSync('git status --porcelain', opts).trim();
+        if (!status) return; // nothing to commit
+    } catch {}
+
+    execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, opts);
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, opts);
             execSync('git push', opts);
-        } catch {}
-    } else {
-        execSync('git add .', opts);
-        try {
-            execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, opts);
-            execSync('git push', opts);
-        } catch {}
+            return; // success
+        } catch (err) {
+            if (attempt === maxRetries) {
+                throw new Error(`git push failed after ${maxRetries} attempts: ${err.message}`);
+            }
+            // Pull rebase and retry
+            try {
+                execSync('git pull --rebase', opts);
+            } catch (pullErr) {
+                // If rebase fails, abort and retry fresh
+                try { execSync('git rebase --abort', opts); } catch {}
+                execSync('git pull --rebase', opts);
+            }
+        }
     }
 }
 
 function cleanupServer() {
     if (MODE === 'server') {
-        try { rmSync('/tmp/claudelogs-staging', { recursive: true, force: true }); } catch {}
+        try { rmSync(`/tmp/claudelogs-staging-${SESSION_ID}`, { recursive: true, force: true }); } catch {}
     }
 }
 
@@ -324,7 +329,6 @@ Respond with valid JSON only.`;
     ];
     if (allEntries.length === 0) return;
 
-    // Classify each entry as tier1 or tier2
     const classifyPrompt = `For each entry below, classify as "tier1" (generic — tool failures, Linux quirks, shell/env gotchas, recurring habits, not tied to any specific repo) or "tier2" (project-specific — bugs, domain config, errors tied to a particular codebase). Return JSON array of objects with index and tier.
 
 Entries:
@@ -359,7 +363,6 @@ Respond with valid JSON only, e.g. [{"index":0,"tier":"tier1"},{"index":1,"tier"
 
         if (tier === 'tier1') {
             dir = join(writeDir, LOGS_BASE, 'knowledge-base', 'tier1');
-            // Compressed format: problem + fix, no prose
             content = `**Problem:** ${entry.summary}\n**Fix:** ${entry.fix}\n**Type:** ${entry.type}\n`;
         } else {
             dir = join(writeDir, LOGS_BASE, 'knowledge-base', 'tier2', projectSlug);
@@ -443,17 +446,17 @@ async function main() {
     }
 
     try {
-        // Run all 4 destinations in parallel
         // Dev log runs first so time log can use its result
         const devLogResult = await writeDevLog(buffer, writeDir, projectSlug);
 
+        // Remaining 3 destinations in parallel
         await Promise.all([
             Promise.resolve(writeTimeLog(buffer, writeDir, projectSlug, devLogResult)),
             writeKnowledgeBase(buffer, writeDir, projectSlug),
             writeDiffSummaries(buffer, writeDir, projectSlug),
         ]);
 
-        // Commit and push
+        // Commit and push with retry
         const dateStr = new Date().toISOString().slice(0, 10);
         commitAndPush(writeDir, `log: ${dateStr} session (${TRIGGER})`);
 
@@ -468,6 +471,5 @@ async function main() {
 
 main().catch(err => {
     logError(`Logger fatal: ${err.message}`);
-    // Never crash the hook
     process.exit(0);
 });

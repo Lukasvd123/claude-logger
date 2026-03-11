@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # buffer-action.sh — PostToolUse hook
-# Appends structured JSON lines to session buffer for later processing
+# Appends structured JSON lines to a per-session buffer
 
 {
     INPUT=$(cat)
@@ -8,8 +8,10 @@
     TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     HOSTNAME_VAL=$(hostname)
     CWD=$(pwd)
-    DATE_HOUR=$(date +"%Y-%m-%d_%H")
-    BUFFER="/tmp/claude-session-${DATE_HOUR}.jsonl"
+
+    # Extract session_id for per-session isolation
+    SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // "unknown"')
+    BUFFER="/tmp/claude-session-${SESSION_ID}.jsonl"
 
     TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // "unknown"')
     TOOL_INPUT_RAW=$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null | head -c 150)
@@ -46,13 +48,13 @@
         >> "$BUFFER"
 
     # Mid-session flush: cwd changed AND buffer >= 3 lines
-    LAST_CWD_FILE="/tmp/claude-last-cwd"
+    LAST_CWD_FILE="/tmp/claude-last-cwd-${SESSION_ID}"
     if [ -f "$LAST_CWD_FILE" ]; then
         LAST_CWD=$(cat "$LAST_CWD_FILE")
         BUFFER_LINES=$(wc -l < "$BUFFER" 2>/dev/null || echo 0)
         if [ "$CWD" != "$LAST_CWD" ] && [ "$BUFFER_LINES" -ge 3 ]; then
             HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
-            node "$HOOKS_DIR/obsidian-logger.mjs" --trigger mid-session >> /tmp/claudelogs-errors.log 2>&1 &
+            node "$HOOKS_DIR/obsidian-logger.mjs" --trigger mid-session --session-id "$SESSION_ID" >> /tmp/claudelogs-errors.log 2>&1 &
         fi
     fi
     echo "$CWD" > "$LAST_CWD_FILE"
