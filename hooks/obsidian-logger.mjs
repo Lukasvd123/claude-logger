@@ -125,7 +125,7 @@ function setupServerRepo() {
 
 function commitAndPush(writeDir, message) {
     // Use -c credential.helper= to bypass gh auth and use the PAT in the remote URL
-    const g = 'git -c "credential.https://github.com.helper="';
+    const g = 'git -c "credential.https://github.com.helper=" -c commit.gpgsign=false';
     const opts = { cwd: writeDir, stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000, encoding: 'utf8' };
     const maxRetries = 3;
 
@@ -136,7 +136,7 @@ function commitAndPush(writeDir, message) {
         if (!status) return;
     } catch {}
 
-    execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, opts);
+    execSync(`${g} commit -m "${message.replace(/"/g, '\\"')}"`, opts);
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
