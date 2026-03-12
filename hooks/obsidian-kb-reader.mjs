@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// obsidian-kb-reader.mjs — Two-tier KB fetcher for session-start injection
-// Uses `claude -p` for tier 2 selection (OAuth subscription, no API key needed).
-// Outputs markdown to stdout. Hard 5s timeout enforced by caller.
+// obsidian-kb-reader.mjs — KB fetcher for session-start injection
+// v3: Flat knowledge dir, essentials, tier filtering via frontmatter
+// Uses `claude -p` for relevance selection. Outputs markdown to stdout.
 
 import { execSync, spawn } from 'child_process';
 import { readFileSync, readdirSync, existsSync } from 'fs';
@@ -12,7 +12,7 @@ const VAULT_PATH = process.env.VAULT_PATH;
 const MODE = VAULT_PATH ? 'personal' : 'server';
 const REPO_OWNER = 'Lukasvd123';
 const REPO_NAME = 'Claudelogs';
-const KB_BASE = 'claude-logs/knowledge-base';
+const BASE = 'claude-logs';
 
 // --- Helpers ---
 
@@ -40,9 +40,7 @@ async function githubFetch(path) {
 
 async function githubReadFile(path) {
     const url = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/${path}`;
-    const resp = await fetch(url, {
-        headers: { Authorization: `Bearer ${GITHUB_PAT}` },
-    });
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${GITHUB_PAT}` } });
     if (!resp.ok) return null;
     return resp.text();
 }
@@ -64,8 +62,7 @@ function claudeCall(prompt, timeoutMs = 4000) {
             if (key.startsWith('CLAUDE') && key !== 'CLAUDELOGS_INTERNAL') delete env[key];
         }
         const proc = spawn('claude', ['-p', '--model', 'haiku'], {
-            env,
-            stdio: ['pipe', 'pipe', 'pipe'],
+            env, stdio: ['pipe', 'pipe', 'pipe'],
         });
         let stdout = '';
         proc.stdout.on('data', d => { stdout += d; });
@@ -81,61 +78,114 @@ function claudeCall(prompt, timeoutMs = 4000) {
     });
 }
 
-// --- Tier 1: Always injected ---
+// --- Extract tier from frontmatter ---
 
-async function fetchTier1() {
+function getTier(content) {
+    const match = content.match(/^tier:\s*(tier[12])/m);
+    return match ? match[1] : 'tier2';
+}
+
+function getProject(content) {
+    const match = content.match(/^project:\s*(.+)$/m);
+    return match ? match[1].trim() : null;
+}
+
+// --- Fetch all knowledge entries ---
+
+async function fetchKnowledge() {
     const entries = [];
     if (MODE === 'personal') {
-        const dir = join(VAULT_PATH, KB_BASE, 'tier1');
+        const dir = join(VAULT_PATH, BASE, 'knowledge');
         for (const file of localReadDir(dir)) {
             const content = localReadFile(file.path);
-            if (content) entries.push({ name: file.name, content });
+            if (content) {
+                entries.push({
+                    name: file.name,
+                    content,
+                    tier: getTier(content),
+                    project: getProject(content),
+                });
+            }
+        }
+        // Also check legacy dirs for backward compat
+        for (const legacyDir of [
+            join(VAULT_PATH, BASE, 'knowledge-base', 'tier1'),
+        ]) {
+            for (const file of localReadDir(legacyDir)) {
+                const content = localReadFile(file.path);
+                if (content) entries.push({ name: file.name, content, tier: 'tier1', project: null });
+            }
+        }
+        // Legacy tier2
+        const t2base = join(VAULT_PATH, BASE, 'knowledge-base', 'tier2');
+        if (existsSync(t2base)) {
+            try {
+                for (const projDir of readdirSync(t2base)) {
+                    const projPath = join(t2base, projDir);
+                    for (const file of localReadDir(projPath)) {
+                        const content = localReadFile(file.path);
+                        if (content) entries.push({ name: file.name, content, tier: 'tier2', project: projDir });
+                    }
+                }
+            } catch {}
         }
     } else {
-        const listing = await githubFetch(`${KB_BASE}/tier1`);
-        if (!Array.isArray(listing)) return entries;
-        for (const item of listing) {
-            if (!item.name.endsWith('.md')) continue;
-            const content = await githubReadFile(item.path);
-            if (content) entries.push({ name: item.name, content });
+        const listing = await githubFetch(`${BASE}/knowledge`);
+        if (Array.isArray(listing)) {
+            for (const item of listing) {
+                if (!item.name.endsWith('.md')) continue;
+                const content = await githubReadFile(item.path);
+                if (content) {
+                    entries.push({
+                        name: item.name,
+                        content,
+                        tier: getTier(content),
+                        project: getProject(content),
+                    });
+                }
+            }
         }
     }
     return entries;
 }
 
-// --- Tier 2: Project-scoped, Claude selects ---
+// --- Fetch essentials ---
 
-async function fetchTier2(slug) {
+async function fetchEssentials(slug) {
     const entries = [];
     if (MODE === 'personal') {
-        const dir = join(VAULT_PATH, KB_BASE, 'tier2', slug);
+        const dir = join(VAULT_PATH, BASE, 'essentials');
         if (!existsSync(dir)) return entries;
         for (const file of localReadDir(dir)) {
-            const content = localReadFile(file.path);
-            if (content) entries.push({ name: file.name, content });
+            if (file.name.includes('global') || file.name.includes(slug)) {
+                const content = localReadFile(file.path);
+                if (content) entries.push({ name: file.name, content });
+            }
         }
     } else {
-        const listing = await githubFetch(`${KB_BASE}/tier2/${slug}`);
-        if (!Array.isArray(listing)) return entries;
-        for (const item of listing) {
-            if (!item.name.endsWith('.md')) continue;
-            const content = await githubReadFile(item.path);
-            if (content) entries.push({ name: item.name, content });
+        const listing = await githubFetch(`${BASE}/essentials`);
+        if (Array.isArray(listing)) {
+            for (const item of listing) {
+                if (!item.name.endsWith('.md')) continue;
+                if (item.name.includes('global') || item.name.includes(slug)) {
+                    const content = await githubReadFile(item.path);
+                    if (content) entries.push({ name: item.name, content });
+                }
+            }
         }
     }
     return entries;
 }
 
-async function selectRelevantTier2(entries, slug) {
-    if (entries.length === 0) return [];
+// --- Select relevant tier2 entries ---
+
+async function selectRelevant(entries, slug) {
     if (entries.length <= 8) return entries;
 
     const summaries = entries.map((e, i) => `[${i}] ${e.name}: ${e.content.slice(0, 200)}`).join('\n');
-    const cwd = process.cwd();
-
     try {
         const result = await claudeCall(
-            `Given project "${slug}" at "${cwd}", select the top 8 most relevant KB entries. Return ONLY a JSON array of indices, e.g. [0,2,5]. No explanation.\n\n${summaries}`,
+            `Given project "${slug}" at "${process.cwd()}", select the top 8 most relevant KB entries. Return ONLY a JSON array of indices. No explanation.\n\n${summaries}`,
             4000,
         );
         const indices = JSON.parse(result.match(/\[[\d,\s]+\]/)?.[0] || '[]');
@@ -145,65 +195,42 @@ async function selectRelevantTier2(entries, slug) {
     }
 }
 
-// --- Essentials: credentials, configs, important values ---
-
-async function fetchEssentials(slug) {
-    const entries = [];
-    if (MODE === 'personal') {
-        const dir = join(VAULT_PATH, 'claude-logs', 'essentials');
-        if (!existsSync(dir)) return entries;
-        for (const file of localReadDir(dir)) {
-            // Include global essentials + current project essentials
-            if (file.name.includes('global') || file.name.includes(slug)) {
-                const content = localReadFile(file.path);
-                if (content) entries.push({ name: file.name, content });
-            }
-        }
-    } else {
-        const listing = await githubFetch('claude-logs/essentials');
-        if (!Array.isArray(listing)) return entries;
-        for (const item of listing) {
-            if (!item.name.endsWith('.md')) continue;
-            if (item.name.includes('global') || item.name.includes(slug)) {
-                const content = await githubReadFile(item.path);
-                if (content) entries.push({ name: item.name, content });
-            }
-        }
-    }
-    return entries;
-}
-
 // --- Main ---
 
 async function main() {
     const slug = getProjectSlug();
-    const [tier1Entries, tier2AllEntries, essentialEntries] = await Promise.all([
-        fetchTier1(),
-        fetchTier2(slug),
+    const [allKnowledge, essentialEntries] = await Promise.all([
+        fetchKnowledge(),
         fetchEssentials(slug),
     ]);
 
-    const tier2Entries = await selectRelevantTier2(tier2AllEntries, slug);
+    // Split by tier
+    const tier1 = allKnowledge.filter(e => e.tier === 'tier1');
+    const tier2All = allKnowledge.filter(e => e.tier === 'tier2');
 
-    if (tier1Entries.length === 0 && tier2Entries.length === 0 && essentialEntries.length === 0) {
+    // For tier2: prefer current project, then select from rest
+    const tier2Project = tier2All.filter(e => e.project === slug || e.project === null);
+    const tier2 = await selectRelevant(tier2Project.length > 0 ? tier2Project : tier2All, slug);
+
+    if (tier1.length === 0 && tier2.length === 0 && essentialEntries.length === 0) {
         process.exit(0);
     }
 
     const output = [];
     output.push('## Knowledge Base\n');
 
-    if (tier1Entries.length > 0) {
-        output.push('### Always-applicable patterns\n');
-        for (const entry of tier1Entries) {
+    if (tier1.length > 0) {
+        output.push('### Universal patterns (tier1)\n');
+        for (const entry of tier1) {
             output.push('<!-- tier1-entry -->');
             output.push(entry.content.trim());
             output.push('');
         }
     }
 
-    if (tier2Entries.length > 0) {
-        output.push(`### Project: ${slug} — relevant past notes\n`);
-        for (const entry of tier2Entries) {
+    if (tier2.length > 0) {
+        output.push(`### Project-specific: ${slug} (tier2)\n`);
+        for (const entry of tier2) {
             output.push('<!-- tier2-entry -->');
             output.push(entry.content.trim());
             output.push('');
@@ -211,7 +238,7 @@ async function main() {
     }
 
     if (essentialEntries.length > 0) {
-        output.push('### Essentials — credentials, configs, and important values\n');
+        output.push('### Essentials — credentials, configs, important values\n');
         for (const entry of essentialEntries) {
             output.push('<!-- essentials-entry -->');
             output.push(entry.content.trim());

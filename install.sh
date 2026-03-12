@@ -103,7 +103,7 @@ if [ "$MODE" = "personal" ]; then
         info "Claudelogs already cloned at $VAULT_PATH_EXPANDED"
     fi
     # Ensure directory structure exists
-    mkdir -p "$VAULT_PATH_EXPANDED/claude-logs"/{dev-logs,knowledge-base/tier1,knowledge-base/tier2,time-log,diff-summaries,essentials}
+    mkdir -p "$VAULT_PATH_EXPANDED/claude-logs"/{knowledge,sessions,projects,machines,essentials,diff-summaries,time-log}
 fi
 
 # --- Write env file (separate from shell profile) ---
