@@ -207,6 +207,7 @@ function isDuplicate(existingNames, newTitle) {
 
 async function analyzeSession(buffer, projectSlug) {
     const hasGitOps = buffer.some(b => b.action_type === 'git_op');
+    const hasMeaningfulWork = buffer.some(b => ['file_write', 'git_op', 'fs_op', 'permission_change'].includes(b.action_type));
 
     const bufferSummary = buffer.map(b =>
         `[${b.timestamp}] ${b.tool_name} (${b.action_type}): ${b.extra || b.tool_input_preview}`
@@ -215,25 +216,38 @@ async function analyzeSession(buffer, projectSlug) {
     const prompt = `You are a structured log analyzer. Analyze this Claude Code session buffer and return a single JSON object. No explanation, no markdown fences, just valid JSON.
 
 {
+  "should_log": true,
   "dev_log": {
     "category": "one of: feature, bugfix, refactor, config, devops, research, docs, setup, other",
     "kebab_title": "short-kebab-title-max-6-words",
+    "description": "2-3 sentence summary for Obsidian search — include key terms someone would search for",
+    "aliases": ["alternative search terms", "e.g. if about nginx config, include: reverse proxy, web server"],
     "what_was_asked": "one sentence summary of what the user wanted",
     "what_was_done": ["bullet 1", "bullet 2"],
     "files_written": [{"path": "/full/path", "machine": "hostname"}],
     "permission_changes": [],
     "fs_ops": [],
     "folders_used": ["/unique/dirs"],
-    "tags": ["relevant", "tags"],
+    "tags": ["specific", "searchable", "tags", "include-tool-names", "include-tech-names"],
     "duration_minutes": 0
   },
   "kb_entries": [
     {
-      "summary": "one-line problem description",
-      "fix": "one-line fix description",
+      "summary": "one-line problem description — be specific, include error messages or tool names",
+      "fix": "one-line fix description — include the actual command or config change",
       "type": "solution or failure",
       "tier": "tier1 if generic (tool failures, Linux quirks, shell gotchas, not repo-specific) or tier2 if project-specific",
-      "tags": ["short", "relevant", "tags", "for-obsidian-search"]
+      "tags": ["specific", "searchable", "tags"],
+      "aliases": ["alternative search terms for this problem"]
+    }
+  ],
+  "essentials": [
+    {
+      "key": "short-kebab-key (e.g. github-pat, db-password, api-url, ssh-key-path)",
+      "category": "credential|url|config|path|key",
+      "value": "the actual value or path",
+      "context": "what this is for, where it's used",
+      "project": "project-slug or 'global'"
     }
   ],
   "diff_summaries": [
@@ -245,9 +259,13 @@ async function analyzeSession(buffer, projectSlug) {
 }
 
 Rules:
-- kb_entries: only genuinely reusable insights. Empty array if nothing worth logging.
-- diff_summaries: only for git operations (commit/push/merge).${hasGitOps ? '' : ' Empty array — no git ops in this session.'}
-- duration_minutes: estimate from first to last timestamp.
+- should_log: false if this session was trivial (only reads, no real work done, just browsing). true if any meaningful changes or insights happened.${!hasMeaningfulWork ? ' This session has NO file writes or git ops — strongly consider false.' : ''}
+- kb_entries: only genuinely reusable insights. Empty array if nothing worth logging. Make tags SPECIFIC — not "config" but "nginx-config" or "systemd-unit". Include error message fragments people would search for.
+- aliases: alternative ways someone might search for this topic. Think "what would I type in Obsidian search?"
+- essentials: extract ANY passwords, API keys, tokens, important URLs, connection strings, file paths for credentials, or config values mentioned in the session. Include env var names. This is a personal secure log — capture everything useful.
+- diff_summaries: only for git operations.${hasGitOps ? '' : ' Empty array — no git ops.'}
+- tags: be specific and searchable. Include technology names, tool names, error types. Use kebab-case.
+- duration_minutes: estimate from timestamps.
 - Respond with ONLY the JSON object, nothing else.
 
 Session buffer (project: ${projectSlug}):
@@ -274,16 +292,19 @@ function writeDevLog(analysis, buffer, writeDir, projectSlug) {
     const dir = join(writeDir, LOGS_BASE, 'dev-logs', category);
     ensureDir(dir);
 
+    const aliases = d.aliases || [];
     const frontmatter = [
         '---',
         `date: ${dateStr}`,
         `machine: ${hostname}`,
         `duration: ~${d.duration_minutes || '?'}min`,
         `tags: [${(d.tags || []).join(', ')}]`,
+        aliases.length ? `aliases: [${aliases.map(a => `"${a}"`).join(', ')}]` : null,
+        d.description ? `description: "${d.description.replace(/"/g, '\\"')}"` : null,
         `trigger: ${TRIGGER}`,
         `project: ${projectSlug}`,
         '---',
-    ].join('\n');
+    ].filter(Boolean).join('\n');
 
     const body = [
         `# ${title.replace(/-/g, ' ')}`,
@@ -359,9 +380,12 @@ async function writeKnowledgeBase(analysis, writeDir, projectSlug) {
 
         const filename = `${dateStr}-${slug}.md`;
         const tags = entry.tags || [];
+        const aliases = entry.aliases || [];
         // Add tier and type as tags for Obsidian filtering
         const allTags = [...new Set([tier, entry.type, ...tags])];
         let dir, content;
+
+        const aliasLine = aliases.length ? `aliases: [${aliases.map(a => `"${a}"`).join(', ')}]` : null;
 
         if (tier === 'tier1') {
             dir = join(writeDir, LOGS_BASE, 'knowledge-base', 'tier1');
@@ -371,6 +395,7 @@ async function writeKnowledgeBase(analysis, writeDir, projectSlug) {
                 `type: ${entry.type}`,
                 `tier: tier1`,
                 `tags: [${allTags.join(', ')}]`,
+                aliasLine,
                 '---',
                 '',
                 `**Problem:** ${entry.summary}`,
@@ -378,7 +403,7 @@ async function writeKnowledgeBase(analysis, writeDir, projectSlug) {
                 '',
                 `#${entry.type} #tier1 ${tags.map(t => `#${t.replace(/\s+/g, '-')}`).join(' ')}`,
                 '',
-            ].join('\n');
+            ].filter(Boolean).join('\n');
         } else {
             dir = join(writeDir, LOGS_BASE, 'knowledge-base', 'tier2', projectSlug);
             content = [
@@ -388,6 +413,7 @@ async function writeKnowledgeBase(analysis, writeDir, projectSlug) {
                 `tier: tier2`,
                 `project: ${projectSlug}`,
                 `tags: [${allTags.join(', ')}]`,
+                aliasLine,
                 '---',
                 '',
                 `**Problem:** ${entry.summary}`,
@@ -396,7 +422,7 @@ async function writeKnowledgeBase(analysis, writeDir, projectSlug) {
                 '',
                 `#${entry.type} #tier2 #${projectSlug} ${tags.map(t => `#${t.replace(/\s+/g, '-')}`).join(' ')}`,
                 '',
-            ].join('\n');
+            ].filter(Boolean).join('\n');
         }
 
         ensureDir(dir);
@@ -440,6 +466,149 @@ function writeDiffSummaries(analysis, buffer, writeDir, projectSlug) {
     }
 }
 
+// --- KB Cleanup (runs at most once per day) ---
+
+async function cleanupKB(writeDir) {
+    const markerFile = '/tmp/claudelogs-last-cleanup';
+    const now = Date.now();
+
+    // Check if cleanup ran in the last 24 hours
+    try {
+        const lastRun = parseInt(readFileSync(markerFile, 'utf8').trim(), 10);
+        if (now - lastRun < 86400000) return; // 24 hours
+    } catch {}
+
+    writeFileSync(markerFile, String(now));
+
+    // Collect all KB entries
+    const entries = [];
+    for (const tier of ['tier1', 'tier2']) {
+        const base = join(writeDir, LOGS_BASE, 'knowledge-base', tier);
+        if (!existsSync(base)) continue;
+
+        if (tier === 'tier1') {
+            try {
+                for (const f of readdirSync(base).filter(f => f.endsWith('.md'))) {
+                    const content = readFileSync(join(base, f), 'utf8');
+                    entries.push({ file: join(base, f), name: f, tier, content: content.slice(0, 300) });
+                }
+            } catch {}
+        } else {
+            // tier2 has project subdirs
+            try {
+                for (const projDir of readdirSync(base)) {
+                    const projPath = join(base, projDir);
+                    try {
+                        for (const f of readdirSync(projPath).filter(f => f.endsWith('.md'))) {
+                            const content = readFileSync(join(projPath, f), 'utf8');
+                            entries.push({ file: join(projPath, f), name: f, tier, content: content.slice(0, 300) });
+                        }
+                    } catch {}
+                }
+            } catch {}
+        }
+    }
+
+    if (entries.length < 5) return; // Not enough entries to bother
+
+    const summaries = entries.map((e, i) =>
+        `[${i}] ${e.name} (${e.tier}): ${e.content.replace(/---[\s\S]*?---/, '').trim().slice(0, 150)}`
+    ).join('\n');
+
+    try {
+        const result = await claudeCall(
+            `Review these knowledge base entries. Return ONLY a JSON array of indices for entries that are CLEARLY outdated, superseded, or no longer useful. Be conservative — only remove entries that are definitely stale (e.g., fixed in a newer version, about deprecated tools, duplicate of another entry). Return [] if nothing should be removed.\n\nToday: ${new Date().toISOString().slice(0, 10)}\n\n${summaries}`,
+            30000,
+        );
+        const indices = JSON.parse(result.match(/\[[\d,\s]*\]/)?.[0] || '[]');
+        let removed = 0;
+        for (const idx of indices) {
+            if (idx >= 0 && idx < entries.length) {
+                try {
+                    unlinkSync(entries[idx].file);
+                    removed++;
+                } catch {}
+            }
+        }
+        if (removed > 0) logError(`KB cleanup: removed ${removed} stale entries`);
+    } catch (err) {
+        logError(`KB cleanup failed: ${err.message}`);
+    }
+}
+
+function writeEssentials(analysis, writeDir, projectSlug) {
+    const essentials = analysis.essentials || [];
+    if (essentials.length === 0) return;
+
+    const dir = join(writeDir, LOGS_BASE, 'essentials');
+    ensureDir(dir);
+
+    // Essentials are organized by project — one file per project (or global)
+    // Each file is a living document that gets updated, not appended
+    const byProject = {};
+    for (const e of essentials) {
+        const proj = e.project || projectSlug;
+        if (!byProject[proj]) byProject[proj] = [];
+        byProject[proj].push(e);
+    }
+
+    for (const [proj, entries] of Object.entries(byProject)) {
+        const filename = `${proj}-essentials.md`;
+        const filepath = join(dir, filename);
+        const dateStr = new Date().toISOString().slice(0, 10);
+
+        // Load existing entries if file exists
+        let existing = {};
+        if (existsSync(filepath)) {
+            const content = readFileSync(filepath, 'utf8');
+            // Parse existing entries from markdown table
+            const rows = content.match(/^\| .+ \| .+ \| .+ \| .+ \|$/gm) || [];
+            for (const row of rows) {
+                const cols = row.split('|').map(c => c.trim()).filter(Boolean);
+                if (cols.length >= 4 && cols[0] !== 'Key') {
+                    existing[cols[0]] = { category: cols[1], value: cols[2], context: cols[3] };
+                }
+            }
+        }
+
+        // Merge new entries (update existing keys, add new ones)
+        for (const e of entries) {
+            existing[e.key] = { category: e.category, value: e.value, context: e.context };
+        }
+
+        // Write updated file
+        const allTags = [...new Set(Object.values(existing).map(e => e.category))];
+        const frontmatter = [
+            '---',
+            `date: ${dateStr}`,
+            `project: ${proj}`,
+            `tags: [essentials, ${allTags.join(', ')}]`,
+            `description: "Credentials, keys, URLs, and config for ${proj}"`,
+            `aliases: ["${proj} passwords", "${proj} credentials", "${proj} config", "${proj} keys"]`,
+            '---',
+        ].join('\n');
+
+        const table = [
+            `# Essentials — ${proj}`,
+            '',
+            `> Last updated: ${dateStr}`,
+            '',
+            '| Key | Category | Value | Context |',
+            '|-----|----------|-------|---------|',
+            ...Object.entries(existing).map(([key, e]) =>
+                `| ${key} | ${e.category} | ${e.value} | ${e.context} |`
+            ),
+            '',
+            `**Project:** [[${proj}]]`,
+            '',
+            `#essentials #${proj} ${allTags.map(t => `#${t}`).join(' ')}`,
+            '',
+        ].join('\n');
+
+        writeFileSync(filepath, `${frontmatter}\n\n${table}`);
+    }
+}
+
 // --- Main ---
 
 async function main() {
@@ -456,11 +625,28 @@ async function main() {
         const analysis = await analyzeSession(buffer, projectSlug);
         if (!analysis) throw new Error('Failed to parse analysis from claude');
 
-        // Write all 4 destinations
-        const devLogResult = writeDevLog(analysis, buffer, writeDir, projectSlug);
-        writeTimeLog(buffer, writeDir, projectSlug, devLogResult);
-        await writeKnowledgeBase(analysis, writeDir, projectSlug);
-        writeDiffSummaries(analysis, buffer, writeDir, projectSlug);
+        // If Claude determined this session isn't worth logging, skip (but still write essentials)
+        if (analysis.should_log === false && (!analysis.essentials || analysis.essentials.length === 0)) {
+            logError(`Session skipped (should_log=false, no essentials)`);
+            clearBuffer();
+            return;
+        }
+
+        // Write essentials always (even if should_log is false — credentials matter)
+        writeEssentials(analysis, writeDir, projectSlug);
+
+        if (analysis.should_log !== false) {
+            // Write log destinations only if session is worth logging
+            const devLogResult = writeDevLog(analysis, buffer, writeDir, projectSlug);
+            writeTimeLog(buffer, writeDir, projectSlug, devLogResult);
+            await writeKnowledgeBase(analysis, writeDir, projectSlug);
+            writeDiffSummaries(analysis, buffer, writeDir, projectSlug);
+        }
+
+        // KB cleanup: prune stale entries (once per day, end-of-session only)
+        if (TRIGGER === 'end-of-session' && MODE === 'personal') {
+            await cleanupKB(writeDir);
+        }
 
         // Commit and push with retry
         const dateStr = new Date().toISOString().slice(0, 10);

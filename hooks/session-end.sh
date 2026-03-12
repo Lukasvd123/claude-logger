@@ -15,5 +15,6 @@
     CLAUDELOGS_INTERNAL=1 node "$HOOKS_DIR/obsidian-logger.mjs" --trigger end-of-session --session-id "$SESSION_ID"
 
     rm -f "/tmp/claude-last-cwd-${SESSION_ID}"
+    rm -f "/tmp/claude-last-flush-${SESSION_ID}"
 
 } >> /tmp/claudelogs-errors.log 2>&1 || true

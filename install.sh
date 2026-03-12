@@ -103,33 +103,47 @@ if [ "$MODE" = "personal" ]; then
         info "Claudelogs already cloned at $VAULT_PATH_EXPANDED"
     fi
     # Ensure directory structure exists
-    mkdir -p "$VAULT_PATH_EXPANDED/claude-logs"/{dev-logs,knowledge-base/tier1,knowledge-base/tier2,time-log,diff-summaries}
+    mkdir -p "$VAULT_PATH_EXPANDED/claude-logs"/{dev-logs,knowledge-base/tier1,knowledge-base/tier2,time-log,diff-summaries,essentials}
 fi
 
-# --- Detect shell profile ---
-SHELL_NAME=$(basename "$SHELL")
+# --- Write env file (separate from shell profile) ---
+ENV_FILE="$HOME/.claude/env.sh"
+cat > "$ENV_FILE" <<ENVEOF
+# claude-logger environment — managed by install.sh
+# Edit this file to change settings. Do NOT edit your shell profile.
+export GITHUB_PAT="${GITHUB_PAT}"
+$([ "$MODE" = "personal" ] && echo "export VAULT_PATH=\"${VAULT_PATH}\"")
+export CLAUDELOGS_MODE="${MODE}"
+cc() { "\$HOME/.claude/hooks/session-start.sh" "\$@"; }
+ENVEOF
+chmod 644 "$ENV_FILE"
+info "Wrote env config to $ENV_FILE"
+
+# --- Source env file from shell profile (single idempotent line) ---
+MARKER="# claude-logger"
+SOURCE_LINE="${MARKER}"$'\n'"[ -f \"\$HOME/.claude/env.sh\" ] && source \"\$HOME/.claude/env.sh\""
+
+# Detect shell profile — respect user's actual shell, never force bash
+SHELL_NAME=$(basename "${SHELL:-/bin/bash}")
 case "$SHELL_NAME" in
     zsh)  PROFILE="$HOME/.zshrc" ;;
     bash) PROFILE="$HOME/.bashrc" ;;
+    fish) PROFILE="$HOME/.config/fish/config.fish" ;;
     *)    PROFILE="$HOME/.profile" ;;
 esac
 
-# --- Write env vars + cc alias ---
-MARKER="# claude-logger"
-if ! grep -q "$MARKER" "$PROFILE" 2>/dev/null; then
-    {
-        echo ""
-        echo "$MARKER"
-        echo "export GITHUB_PAT=\"${GITHUB_PAT}\""
-        if [ "$MODE" = "personal" ]; then
-            echo "export VAULT_PATH=\"${VAULT_PATH}\""
-        fi
-        echo "export CLAUDELOGS_MODE=\"${MODE}\""
-        echo "cc() { \"\$HOME/.claude/hooks/session-start.sh\" \"\$@\"; }"
-    } >> "$PROFILE"
-    info "Added env vars + cc alias to $PROFILE"
+# Remove old-style inline block if present (from previous installs)
+if grep -q "^export GITHUB_PAT=" "$PROFILE" 2>/dev/null && grep -q "$MARKER" "$PROFILE" 2>/dev/null; then
+    # Strip the old multi-line block between marker and the cc() line
+    sed -i "/${MARKER}/,/^cc()/d" "$PROFILE" 2>/dev/null || true
+    info "Removed old inline claude-logger block from $PROFILE"
+fi
+
+if ! grep -q 'source "$HOME/.claude/env.sh"' "$PROFILE" 2>/dev/null; then
+    printf '\n%s\n' "$SOURCE_LINE" >> "$PROFILE"
+    info "Added source line to $PROFILE"
 else
-    warn "claude-logger block already exists in $PROFILE — skipping"
+    info "Source line already in $PROFILE — skipping"
 fi
 
 # --- Merge settings.json ---

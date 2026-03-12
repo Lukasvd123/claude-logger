@@ -51,13 +51,25 @@
         '{timestamp:$ts, hostname:$host, cwd:$cwd, tool_name:$tool, action_type:$action, extra:$extra, tool_input_preview:$input}' \
         >> "$BUFFER"
 
-    # Mid-session flush: cwd changed AND buffer >= 3 lines
+    # Mid-session flush: only if meaningful work happened + cooldown
     LAST_CWD_FILE="/tmp/claude-last-cwd-${SESSION_ID}"
+    LAST_FLUSH_FILE="/tmp/claude-last-flush-${SESSION_ID}"
     if [ -f "$LAST_CWD_FILE" ]; then
         LAST_CWD=$(cat "$LAST_CWD_FILE")
         BUFFER_LINES=$(wc -l < "$BUFFER" 2>/dev/null || echo 0)
-        if [ "$CWD" != "$LAST_CWD" ] && [ "$BUFFER_LINES" -ge 3 ]; then
+
+        # Count meaningful actions (file writes + git ops), not just reads
+        MEANINGFUL=$(grep -cE '"action_type":"(file_write|git_op|fs_op|permission_change)"' "$BUFFER" 2>/dev/null || echo 0)
+
+        # 5-minute cooldown between mid-session flushes
+        NOW=$(date +%s)
+        LAST_FLUSH=0
+        [ -f "$LAST_FLUSH_FILE" ] && LAST_FLUSH=$(cat "$LAST_FLUSH_FILE" 2>/dev/null || echo 0)
+        ELAPSED=$(( NOW - LAST_FLUSH ))
+
+        if [ "$CWD" != "$LAST_CWD" ] && [ "$BUFFER_LINES" -ge 8 ] && [ "$MEANINGFUL" -ge 3 ] && [ "$ELAPSED" -ge 300 ]; then
             HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+            echo "$NOW" > "$LAST_FLUSH_FILE"
             CLAUDELOGS_INTERNAL=1 node "$HOOKS_DIR/obsidian-logger.mjs" --trigger mid-session --session-id "$SESSION_ID" &
         fi
     fi

@@ -145,18 +145,47 @@ async function selectRelevantTier2(entries, slug) {
     }
 }
 
+// --- Essentials: credentials, configs, important values ---
+
+async function fetchEssentials(slug) {
+    const entries = [];
+    if (MODE === 'personal') {
+        const dir = join(VAULT_PATH, 'claude-logs', 'essentials');
+        if (!existsSync(dir)) return entries;
+        for (const file of localReadDir(dir)) {
+            // Include global essentials + current project essentials
+            if (file.name.includes('global') || file.name.includes(slug)) {
+                const content = localReadFile(file.path);
+                if (content) entries.push({ name: file.name, content });
+            }
+        }
+    } else {
+        const listing = await githubFetch('claude-logs/essentials');
+        if (!Array.isArray(listing)) return entries;
+        for (const item of listing) {
+            if (!item.name.endsWith('.md')) continue;
+            if (item.name.includes('global') || item.name.includes(slug)) {
+                const content = await githubReadFile(item.path);
+                if (content) entries.push({ name: item.name, content });
+            }
+        }
+    }
+    return entries;
+}
+
 // --- Main ---
 
 async function main() {
     const slug = getProjectSlug();
-    const [tier1Entries, tier2AllEntries] = await Promise.all([
+    const [tier1Entries, tier2AllEntries, essentialEntries] = await Promise.all([
         fetchTier1(),
         fetchTier2(slug),
+        fetchEssentials(slug),
     ]);
 
     const tier2Entries = await selectRelevantTier2(tier2AllEntries, slug);
 
-    if (tier1Entries.length === 0 && tier2Entries.length === 0) {
+    if (tier1Entries.length === 0 && tier2Entries.length === 0 && essentialEntries.length === 0) {
         process.exit(0);
     }
 
@@ -176,6 +205,15 @@ async function main() {
         output.push(`### Project: ${slug} — relevant past notes\n`);
         for (const entry of tier2Entries) {
             output.push('<!-- tier2-entry -->');
+            output.push(entry.content.trim());
+            output.push('');
+        }
+    }
+
+    if (essentialEntries.length > 0) {
+        output.push('### Essentials — credentials, configs, and important values\n');
+        for (const entry of essentialEntries) {
+            output.push('<!-- essentials-entry -->');
             output.push(entry.content.trim());
             output.push('');
         }
