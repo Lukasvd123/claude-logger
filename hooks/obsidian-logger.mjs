@@ -111,17 +111,27 @@ function setupServerRepo() {
     return staging;
 }
 
-function commitAndPush(writeDir, message) {
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function commitAndPush(writeDir, message) {
     const g = 'git -c "credential.https://github.com.helper=" -c commit.gpgsign=false';
     const opts = { cwd: writeDir, stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000, encoding: 'utf8' };
+
+    // Pull latest before committing to minimize conflicts across machines
+    try { execSync(`${g} pull --rebase`, opts); } catch {}
+
     execSync('git add .', opts);
     try {
         if (!execSync('git status --porcelain', opts).trim()) return;
     } catch {}
     execSync(`${g} commit -m "${message.replace(/"/g, '\\"')}"`, opts);
-    for (let attempt = 1; attempt <= 3; attempt++) {
+
+    // Retry with random jitter to handle concurrent pushes from different machines
+    for (let attempt = 1; attempt <= 5; attempt++) {
         try { execSync(`${g} push`, opts); return; } catch (err) {
-            if (attempt === 3) throw new Error(`git push failed: ${err.message}`);
+            if (attempt === 5) throw new Error(`git push failed after 5 attempts: ${err.message}`);
+            // Random 1-3s delay to avoid thundering herd from multiple machines
+            await sleep(1000 + Math.random() * 2000);
             try { execSync(`${g} pull --rebase`, opts); } catch {
                 try { execSync('git rebase --abort', opts); } catch {}
                 execSync(`${g} pull --rebase`, opts);
@@ -643,7 +653,7 @@ async function main() {
         }
 
         const dateStr = new Date().toISOString().slice(0, 10);
-        commitAndPush(writeDir, `log: ${dateStr} session (${TRIGGER})`);
+        await commitAndPush(writeDir, `log: ${dateStr} session (${TRIGGER})`);
         clearBuffer();
     } catch (err) {
         logError(`Logger failed: ${err.message}`);
