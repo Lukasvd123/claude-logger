@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // obsidian-kb-reader.mjs — KB fetcher for session-start injection
-// v3: Flat knowledge dir, essentials, tier filtering via frontmatter
+// v3.1: Sonnet selection, no legacy paths, frontmatter stripping, vault health check
 // Uses `claude -p` for relevance selection. Outputs markdown to stdout.
 
 import { execSync, spawn } from 'child_process';
@@ -55,13 +55,13 @@ function localReadFile(filePath) {
     try { return readFileSync(filePath, 'utf8'); } catch { return null; }
 }
 
-function claudeCall(prompt, timeoutMs = 4000) {
+function claudeCall(prompt, timeoutMs = 8000) {
     return new Promise((resolve, reject) => {
         const env = { ...process.env, CLAUDELOGS_INTERNAL: '1' };
         for (const key of Object.keys(env)) {
             if (key.startsWith('CLAUDE') && key !== 'CLAUDELOGS_INTERNAL') delete env[key];
         }
-        const proc = spawn('claude', ['-p', '--model', 'haiku'], {
+        const proc = spawn('claude', ['-p', '--model', 'sonnet'], {
             env, stdio: ['pipe', 'pipe', 'pipe'],
         });
         let stdout = '';
@@ -78,6 +78,29 @@ function claudeCall(prompt, timeoutMs = 4000) {
     });
 }
 
+// --- Vault health check ---
+
+function vaultHealthCheck() {
+    if (MODE !== 'personal') return;
+    const gitDir = join(VAULT_PATH, '.git');
+    if (!existsSync(gitDir)) return;
+
+    // Abort stuck rebase/merge
+    if (existsSync(join(gitDir, 'rebase-merge')) || existsSync(join(gitDir, 'rebase-apply'))) {
+        try { execSync('git rebase --abort', { cwd: VAULT_PATH, stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 }); } catch {}
+    }
+    if (existsSync(join(gitDir, 'MERGE_HEAD'))) {
+        try { execSync('git merge --abort', { cwd: VAULT_PATH, stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 }); } catch {}
+    }
+
+    // Pull latest
+    try {
+        execSync('git -c "credential.https://github.com.helper=" pull --no-rebase -X theirs', {
+            cwd: VAULT_PATH, stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000,
+        });
+    } catch {}
+}
+
 // --- Extract tier from frontmatter ---
 
 function getTier(content) {
@@ -88,6 +111,12 @@ function getTier(content) {
 function getProject(content) {
     const match = content.match(/^project:\s*(.+)$/m);
     return match ? match[1].trim() : null;
+}
+
+// --- Strip YAML frontmatter ---
+
+function stripFrontmatter(content) {
+    return content.replace(/^---\n[\s\S]*?\n---\n*/, '').trim();
 }
 
 // --- Fetch all knowledge entries ---
@@ -106,28 +135,6 @@ async function fetchKnowledge() {
                     project: getProject(content),
                 });
             }
-        }
-        // Also check legacy dirs for backward compat
-        for (const legacyDir of [
-            join(VAULT_PATH, BASE, 'knowledge-base', 'tier1'),
-        ]) {
-            for (const file of localReadDir(legacyDir)) {
-                const content = localReadFile(file.path);
-                if (content) entries.push({ name: file.name, content, tier: 'tier1', project: null });
-            }
-        }
-        // Legacy tier2
-        const t2base = join(VAULT_PATH, BASE, 'knowledge-base', 'tier2');
-        if (existsSync(t2base)) {
-            try {
-                for (const projDir of readdirSync(t2base)) {
-                    const projPath = join(t2base, projDir);
-                    for (const file of localReadDir(projPath)) {
-                        const content = localReadFile(file.path);
-                        if (content) entries.push({ name: file.name, content, tier: 'tier2', project: projDir });
-                    }
-                }
-            } catch {}
         }
     } else {
         const listing = await githubFetch(`${BASE}/knowledge`);
@@ -180,24 +187,30 @@ async function fetchEssentials(slug) {
 // --- Select relevant tier2 entries ---
 
 async function selectRelevant(entries, slug) {
-    if (entries.length <= 8) return entries;
+    if (entries.length <= 10) return entries;
 
-    const summaries = entries.map((e, i) => `[${i}] ${e.name}: ${e.content.slice(0, 200)}`).join('\n');
+    const summaries = entries.map((e, i) => `[${i}] ${e.name}: ${stripFrontmatter(e.content).slice(0, 200)}`).join('\n');
     try {
         const result = await claudeCall(
-            `Given project "${slug}" at "${process.cwd()}", select the top 8 most relevant KB entries. Return ONLY a JSON array of indices. No explanation.\n\n${summaries}`,
-            4000,
+            `Given project "${slug}" at "${process.cwd()}", select the top 10 most relevant KB entries for context injection. Prioritize: (1) same project entries, (2) same technology, (3) most recent. Return ONLY a JSON array of indices. No explanation.\n\n${summaries}`,
+            8000,
         );
         const indices = JSON.parse(result.match(/\[[\d,\s]+\]/)?.[0] || '[]');
         return indices.filter(i => i >= 0 && i < entries.length).map(i => entries[i]);
     } catch {
-        return entries.slice(0, 8);
+        // Smart fallback: prefer same-project, then most recent
+        const sameProject = entries.filter(e => e.project === slug);
+        const rest = entries.filter(e => e.project !== slug);
+        return [...sameProject, ...rest].slice(0, 10);
     }
 }
 
 // --- Main ---
 
 async function main() {
+    // Vault health check + pull latest before reading
+    vaultHealthCheck();
+
     const slug = getProjectSlug();
     const [allKnowledge, essentialEntries] = await Promise.all([
         fetchKnowledge(),
@@ -223,7 +236,7 @@ async function main() {
         output.push('### Universal patterns (tier1)\n');
         for (const entry of tier1) {
             output.push('<!-- tier1-entry -->');
-            output.push(entry.content.trim());
+            output.push(stripFrontmatter(entry.content));
             output.push('');
         }
     }
@@ -232,7 +245,7 @@ async function main() {
         output.push(`### Project-specific: ${slug} (tier2)\n`);
         for (const entry of tier2) {
             output.push('<!-- tier2-entry -->');
-            output.push(entry.content.trim());
+            output.push(stripFrontmatter(entry.content));
             output.push('');
         }
     }
@@ -241,12 +254,18 @@ async function main() {
         output.push('### Essentials — credentials, configs, important values\n');
         for (const entry of essentialEntries) {
             output.push('<!-- essentials-entry -->');
-            output.push(entry.content.trim());
+            output.push(stripFrontmatter(entry.content));
             output.push('');
         }
     }
 
-    process.stdout.write(output.join('\n'));
+    // Sanity check
+    const totalOutput = output.join('\n');
+    if (totalOutput.length < 100) {
+        process.stderr.write('Warning: KB output suspiciously small (<100 bytes)\n');
+    }
+
+    process.stdout.write(totalOutput);
 }
 
 main().catch(err => {

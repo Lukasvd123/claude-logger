@@ -17,26 +17,49 @@
     SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // "unknown"')
     BUFFER="/tmp/claude-session-${SESSION_ID}.jsonl"
 
-    TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // "unknown"')
-    TOOL_INPUT_RAW=$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null | head -c 150)
+    # Buffer size guard: stop appending if JSONL > 200KB
+    if [ -f "$BUFFER" ]; then
+        BUFFER_SIZE=$(stat -c%s "$BUFFER" 2>/dev/null || echo 0)
+        if [ "$BUFFER_SIZE" -ge 204800 ]; then
+            exit 0
+        fi
+    fi
 
-    # Classify action type
+    TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // "unknown"')
+    TOOL_INPUT_RAW=$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null | head -c 500)
+
+    # Classify action type and capture content preview
     ACTION_TYPE="general"
     EXTRA=""
+    CONTENT_PREVIEW=""
 
     if [ "$TOOL_NAME" = "Bash" ]; then
         CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
-        EXTRA=$(echo "$CMD" | head -c 150)
+        EXTRA=$(echo "$CMD" | head -c 500)
         if echo "$CMD" | grep -qE '^\s*git\s+(commit|push|merge|pull|rebase|cherry-pick|tag)'; then
             ACTION_TYPE="git_op"
+            # Capture git diff stat for commits
+            if echo "$CMD" | grep -qE '^\s*git\s+commit'; then
+                CONTENT_PREVIEW=$(git diff HEAD~1 HEAD --stat 2>/dev/null | head -c 1000 || echo "")
+            fi
         elif echo "$CMD" | grep -qE '^\s*(chmod|chown)'; then
             ACTION_TYPE="permission_change"
         elif echo "$CMD" | grep -qE '^\s*(mkdir|cp|mv|rm|rmdir|ln)'; then
             ACTION_TYPE="fs_op"
         fi
-    elif [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "Edit" ]; then
+    elif [ "$TOOL_NAME" = "Write" ]; then
         ACTION_TYPE="file_write"
         EXTRA=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
+        # Capture first 1000 chars of file content
+        CONTENT_PREVIEW=$(echo "$INPUT" | jq -r '.tool_input.content // ""' | head -c 1000)
+    elif [ "$TOOL_NAME" = "Edit" ]; then
+        ACTION_TYPE="file_write"
+        EXTRA=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
+        # Capture old_string -> new_string (300 chars each)
+        OLD_STR=$(echo "$INPUT" | jq -r '.tool_input.old_string // ""' | head -c 300)
+        NEW_STR=$(echo "$INPUT" | jq -r '.tool_input.new_string // ""' | head -c 300)
+        CONTENT_PREVIEW="OLD: ${OLD_STR}
+NEW: ${NEW_STR}"
     fi
 
     # Append to buffer
@@ -48,7 +71,8 @@
         --arg action "$ACTION_TYPE" \
         --arg extra "$EXTRA" \
         --arg input "$TOOL_INPUT_RAW" \
-        '{timestamp:$ts, hostname:$host, cwd:$cwd, tool_name:$tool, action_type:$action, extra:$extra, tool_input_preview:$input}' \
+        --arg preview "$CONTENT_PREVIEW" \
+        '{timestamp:$ts, hostname:$host, cwd:$cwd, tool_name:$tool, action_type:$action, extra:$extra, tool_input_preview:$input, content_preview:$preview}' \
         >> "$BUFFER"
 
     # Mid-session flush: only if meaningful work happened + cooldown

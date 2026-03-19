@@ -78,6 +78,9 @@ HOOK_FILES=(
     "hooks/session-start.sh"
     "hooks/obsidian-logger.mjs"
     "hooks/obsidian-kb-reader.mjs"
+    "hooks/maintenance.mjs"
+    "hooks/cc-search.sh"
+    "hooks/VERSION"
 )
 
 for f in "${HOOK_FILES[@]}"; do
@@ -90,6 +93,7 @@ done
 chmod +x "$HOOKS_DIR/buffer-action.sh"
 chmod +x "$HOOKS_DIR/session-end.sh"
 chmod +x "$HOOKS_DIR/session-start.sh"
+chmod +x "$HOOKS_DIR/cc-search.sh"
 info "Shell scripts marked executable"
 
 # --- Personal mode: clone Claudelogs repo ---
@@ -103,7 +107,7 @@ if [ "$MODE" = "personal" ]; then
         info "Claudelogs already cloned at $VAULT_PATH_EXPANDED"
     fi
     # Ensure directory structure exists
-    mkdir -p "$VAULT_PATH_EXPANDED/claude-logs"/{knowledge,sessions,projects,machines,essentials,diff-summaries,time-log}
+    mkdir -p "$VAULT_PATH_EXPANDED/claude-logs"/{knowledge,sessions,projects,machines,essentials,time-log}
 fi
 
 # --- Write env file (separate from shell profile) ---

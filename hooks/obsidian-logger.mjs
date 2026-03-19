@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // obsidian-logger.mjs — Write-time processor for Claude Code session logs
-// v3: Flat knowledge dir, daily session roll-ups, hub notes, graph-first design
+// v3.1: Sonnet analysis, semantic dedup, merge-based git, lock files, content previews
 // Uses `claude -p` (local CLI) — works with OAuth subscriptions, no API key needed.
 
 import { execSync, spawn } from 'child_process';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, rmSync, statSync } from 'fs';
 import { join, basename } from 'path';
 
 const GITHUB_PAT = process.env.GITHUB_PAT;
@@ -62,15 +62,41 @@ function clearBuffer() {
     try { unlinkSync(`/tmp/claude-session-${SESSION_ID}.jsonl`); } catch {}
 }
 
+// --- Lock file for concurrent flush prevention ---
+
+const LOCK_FILE = `/tmp/claudelogs-flush-${SESSION_ID}.lock`;
+
+function acquireLock() {
+    try {
+        writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+        return true;
+    } catch {
+        // Check if stale (>3 min old)
+        try {
+            const stat = statSync(LOCK_FILE);
+            if (Date.now() - stat.mtimeMs > 180000) {
+                unlinkSync(LOCK_FILE);
+                writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+                return true;
+            }
+        } catch {}
+        return false;
+    }
+}
+
+function releaseLock() {
+    try { unlinkSync(LOCK_FILE); } catch {}
+}
+
 // --- Claude CLI call ---
 
-function claudeCall(prompt, timeoutMs = 60000) {
+function claudeCall(prompt, timeoutMs = 120000) {
     return new Promise((resolve, reject) => {
         const env = { ...process.env, CLAUDELOGS_INTERNAL: '1' };
         for (const key of Object.keys(env)) {
             if (key.startsWith('CLAUDE') && key !== 'CLAUDELOGS_INTERNAL') delete env[key];
         }
-        const proc = spawn('claude', ['-p', '--model', 'haiku'], {
+        const proc = spawn('claude', ['-p', '--model', 'sonnet'], {
             env, stdio: ['pipe', 'pipe', 'pipe'],
         });
         let stdout = '', stderr = '';
@@ -111,14 +137,36 @@ function setupServerRepo() {
     return staging;
 }
 
+// --- Vault health check ---
+
+function vaultHealthCheck(writeDir) {
+    const gitDir = join(writeDir, '.git');
+    if (!existsSync(gitDir)) return;
+
+    // Detect stuck rebase
+    if (existsSync(join(gitDir, 'rebase-merge')) || existsSync(join(gitDir, 'rebase-apply'))) {
+        logError('Vault health: stuck rebase detected, aborting');
+        try { execSync('git rebase --abort', { cwd: writeDir, stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 }); } catch {}
+    }
+
+    // Detect stuck merge
+    if (existsSync(join(gitDir, 'MERGE_HEAD'))) {
+        logError('Vault health: stuck merge detected, aborting');
+        try { execSync('git merge --abort', { cwd: writeDir, stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 }); } catch {}
+    }
+}
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function commitAndPush(writeDir, message) {
     const g = 'git -c "credential.https://github.com.helper=" -c commit.gpgsign=false';
     const opts = { cwd: writeDir, stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000, encoding: 'utf8' };
 
-    // Pull latest before committing to minimize conflicts across machines
-    try { execSync(`${g} pull --rebase`, opts); } catch {}
+    // Health check before any git ops
+    vaultHealthCheck(writeDir);
+
+    // Pull latest with merge (not rebase) — append-only files are safe with "theirs"
+    try { execSync(`${g} pull --no-rebase -X theirs`, opts); } catch {}
 
     execSync('git add .', opts);
     try {
@@ -130,12 +178,10 @@ async function commitAndPush(writeDir, message) {
     for (let attempt = 1; attempt <= 5; attempt++) {
         try { execSync(`${g} push`, opts); return; } catch (err) {
             if (attempt === 5) throw new Error(`git push failed after 5 attempts: ${err.message}`);
-            // Random 1-3s delay to avoid thundering herd from multiple machines
             await sleep(1000 + Math.random() * 2000);
-            try { execSync(`${g} pull --rebase`, opts); } catch {
-                try { execSync('git rebase --abort', opts); } catch {}
-                execSync(`${g} pull --rebase`, opts);
-            }
+            // Health check before re-pull
+            vaultHealthCheck(writeDir);
+            try { execSync(`${g} pull --no-rebase -X theirs`, opts); } catch {}
         }
     }
 }
@@ -146,26 +192,58 @@ function cleanupServer() {
     }
 }
 
-// --- Dedup KB ---
+// --- Semantic dedup ---
 
-function existingKBNames(writeDir) {
-    const names = new Set();
+function existingKBEntries(writeDir) {
+    const entries = [];
     const dir = join(writeDir, BASE, 'knowledge');
     try {
-        for (const f of readdirSync(dir)) {
-            if (f.endsWith('.md')) names.add(f.toLowerCase());
+        for (const f of readdirSync(dir).filter(f => f.endsWith('.md'))) {
+            const content = readFileSync(join(dir, f), 'utf8');
+            const titleMatch = content.match(/^# (.+)$/m);
+            const problemMatch = content.match(/\*\*Problem:\*\*\s*(.+)/);
+            entries.push({
+                file: f,
+                title: titleMatch?.[1] || f,
+                problem: problemMatch?.[1] || '',
+            });
         }
     } catch {}
-    return names;
+    return entries;
 }
 
-function isDuplicate(existingNames, slug) {
-    const lower = slug.toLowerCase();
-    for (const name of existingNames) {
-        const stripped = name.replace(/\.md$/, '').replace(/^\d{4}-\d{2}-\d{2}-/, '');
-        if (stripped.includes(lower) || lower.includes(stripped)) return true;
+async function semanticDedup(newEntries, existingEntries) {
+    if (newEntries.length === 0) return newEntries;
+
+    const allEntries = [
+        ...existingEntries.map((e, i) => `[E${i}] "${e.title}" — ${e.problem.slice(0, 100)}`),
+        ...newEntries.map((e, i) => `[N${i}] "${e.title}" — ${(e.problem || '').slice(0, 100)}`),
+    ];
+
+    if (allEntries.length < 2) return newEntries;
+
+    try {
+        const result = await claudeCall(
+            `Compare these KB entries. Identify NEW entries (N-prefixed) that are TRUE duplicates of EXISTING entries (E-prefixed). Same problem AND same solution = duplicate. Similar topic but different solution = NOT duplicate. Return JSON: {"duplicates": [0, 2]} — array of N-indices to REMOVE. Return {"duplicates": []} if no duplicates.\n\n${allEntries.join('\n')}`,
+            30000,
+        );
+        const parsed = JSON.parse(result.match(/\{[\s\S]*?\}/)?.[0] || '{"duplicates":[]}');
+        const dupes = new Set(parsed.duplicates || []);
+        return newEntries.filter((_, i) => !dupes.has(i));
+    } catch (err) {
+        logError(`Semantic dedup failed, falling back to slug match: ${err.message}`);
+        // Fallback: slug-based dedup
+        const existingNames = new Set(existingEntries.map(e => e.file.toLowerCase()));
+        return newEntries.filter(entry => {
+            const slug = (entry.title || entry.problem || 'untitled')
+                .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+            for (const name of existingNames) {
+                const stripped = name.replace(/\.md$/, '').replace(/^\d{4}-\d{2}-\d{2}-/, '');
+                if (stripped.includes(slug) || slug.includes(stripped)) return false;
+            }
+            return true;
+        });
     }
-    return false;
 }
 
 // --- Analysis prompt ---
@@ -176,9 +254,13 @@ async function analyzeSession(buffer, projectSlug) {
         ['file_write', 'git_op', 'fs_op', 'permission_change'].includes(b.action_type)
     );
 
-    const bufferSummary = buffer.map(b =>
-        `[${b.timestamp}] ${b.tool_name} (${b.action_type}): ${b.extra || b.tool_input_preview}`
-    ).join('\n');
+    const bufferSummary = buffer.map(b => {
+        let line = `[${b.timestamp}] ${b.tool_name} (${b.action_type}): ${b.extra || b.tool_input_preview}`;
+        if (b.content_preview) {
+            line += `\n  CONTENT: ${b.content_preview.slice(0, 500)}`;
+        }
+        return line;
+    }).join('\n');
 
     const prompt = `You are a structured log analyzer. Analyze this Claude Code session and return a single JSON object. No explanation, no fences, just valid JSON.
 
@@ -195,8 +277,10 @@ async function analyzeSession(buffer, projectSlug) {
   "kb_entries": [
     {
       "title": "Short searchable title — include the key tech/tool name",
-      "problem": "What went wrong or what needed solving — include error messages",
-      "solution": "What fixed it — include actual commands or config changes",
+      "problem": "Detailed description with error messages — what went wrong or what needed solving",
+      "root_cause": "Why it happened — the underlying cause",
+      "solution": "Step-by-step with actual commands or code changes",
+      "gotchas": ["Edge case or caveat 1", "Edge case or caveat 2"],
       "type": "solution|failure|pattern",
       "tier": "tier1|tier2",
       "tags": ["specific", "searchable"],
@@ -211,35 +295,40 @@ async function analyzeSession(buffer, projectSlug) {
       "context": "what this is for",
       "scope": "project-slug or global"
     }
-  ],
-  "diff_summaries": [
-    { "command": "git command", "bullets": ["change 1", "change 2"] }
   ]
 }
 
+QUALITY GATE for kb_entries: "Would this entry let me solve this exact problem in <2 minutes if I encounter it again in 3 months?" If not, make it more specific or skip it.
+
 CRITICAL tier rules — most entries should be tier2:
 - tier1: ONLY if a random developer on a random project would benefit. Universal patterns like "git signing breaks automated commits" or "SELinux blocks service access". Ask yourself: "Would this matter if I was working on a completely different project?" If no → tier2.
-- tier2: EVERYTHING ELSE. Project-specific, context-specific, tool-specific workflows, niche tool issues (MSI extraction, specific package configs, project-specific workarounds). When in doubt → tier2.
+- tier2: EVERYTHING ELSE. Project-specific, context-specific, tool-specific workflows, niche tool issues. When in doubt → tier2.
+
+KB entry format requirements:
+- title: Specific tech names, not generic ("nginx proxy_pass drops websocket upgrade headers" not "config issue")
+- problem: Include actual error messages from the session
+- root_cause: Explain WHY, not just WHAT
+- solution: Actual commands, code, or config — not vague descriptions
+- gotchas: Edge cases, things that almost worked but didn't
 
 Other rules:
 - should_log: false if trivial (only reads, browsing, no real work).${!hasMeaningfulWork ? ' No file writes or git ops in this session — strongly consider false.' : ''}
-- kb_entries: only genuinely reusable insights. Empty array is fine. Be SPECIFIC in titles — not "config issue" but "nginx proxy_pass drops websocket upgrade headers".
+- kb_entries: only genuinely reusable insights. Empty array is fine.
 - essentials: capture ALL passwords, API keys, tokens, URLs, connection strings, credential paths, env vars. This is a secure personal log.
-- diff_summaries: only for git operations.${hasGitOps ? '' : ' Empty array — no git ops.'}
 - tags: specific, kebab-case. Include technology names, commands, error types.
-- related_to: list project slugs, machine names, or technologies this entry relates to (used for graph connections).
+- related_to: list project slugs, machine names, or technologies this entry relates to.
 - Respond with ONLY the JSON object.
 
 Session buffer (project: ${projectSlug}):
 ${bufferSummary}`;
 
-    const raw = await claudeCall(prompt, 90000);
+    const raw = await claudeCall(prompt, 120000);
     return parseJSON(raw);
 }
 
 // --- Writers ---
 
-// Session log: daily roll-up per machine (append, not create new file)
+// Session log: daily roll-up per machine
 function writeSession(analysis, buffer, writeDir, projectSlug) {
     const s = analysis.session;
     if (!s) return null;
@@ -256,7 +345,6 @@ function writeSession(analysis, buffer, writeDir, projectSlug) {
     const filename = `${dateStr}-${hostname}.md`;
     const filepath = join(dir, filename);
 
-    // Create file with frontmatter if new
     if (!existsSync(filepath)) {
         const frontmatter = [
             '---',
@@ -271,7 +359,6 @@ function writeSession(analysis, buffer, writeDir, projectSlug) {
         writeFileSync(filepath, frontmatter);
     }
 
-    // Append session entry
     const tags = (s.tags || []).map(t => `#${t.replace(/\s+/g, '-')}`).join(' ');
     const entry = [
         `## ${startTime} — ${title}`,
@@ -292,7 +379,7 @@ function writeSession(analysis, buffer, writeDir, projectSlug) {
     return { title, category, duration: s.duration_minutes, startTime, hostname };
 }
 
-// Time log (unchanged)
+// Time log
 function writeTimeLog(buffer, writeDir, projectSlug, sessionResult) {
     const firstTs = buffer[0]?.timestamp || new Date().toISOString();
     const hostname = buffer[0]?.hostname || 'unknown';
@@ -316,13 +403,18 @@ function writeTimeLog(buffer, writeDir, projectSlug, sessionResult) {
     writeFileSync(file, content);
 }
 
-// Knowledge: flat directory, tier in frontmatter
-function writeKnowledge(analysis, writeDir, projectSlug) {
-    const entries = analysis.kb_entries || [];
+// Knowledge: flat directory, tier in frontmatter, structured format
+async function writeKnowledge(analysis, writeDir, projectSlug) {
+    let entries = analysis.kb_entries || [];
     if (entries.length === 0) return;
 
     const dateStr = new Date().toISOString().slice(0, 10);
-    const existing = existingKBNames(writeDir);
+    const existing = existingKBEntries(writeDir);
+
+    // Semantic dedup: check new entries against existing
+    entries = await semanticDedup(entries, existing);
+    if (entries.length === 0) return;
+
     const dir = join(writeDir, BASE, 'knowledge');
     ensureDir(dir);
 
@@ -330,16 +422,19 @@ function writeKnowledge(analysis, writeDir, projectSlug) {
         const slug = (entry.title || entry.problem || 'untitled')
             .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
 
-        if (isDuplicate(existing, slug)) continue;
-
         const tier = entry.tier === 'tier1' ? 'tier1' : 'tier2';
         const tags = [...new Set([tier, entry.type, ...(entry.tags || [])])];
         const relatedLinks = (entry.related_to || [projectSlug])
             .map(r => `[[${r}]]`).join(' ');
 
+        const gotchasSection = (entry.gotchas && entry.gotchas.length > 0)
+            ? ['**Gotchas:**', ...entry.gotchas.map(g => `- ${g}`), '']
+            : [];
+
         const content = [
             '---',
             `date: ${dateStr}`,
+            `last_verified: ${dateStr}`,
             `type: ${entry.type || 'solution'}`,
             `tier: ${tier}`,
             tier === 'tier2' ? `project: ${projectSlug}` : null,
@@ -348,10 +443,13 @@ function writeKnowledge(analysis, writeDir, projectSlug) {
             '',
             `# ${entry.title || slug}`,
             '',
-            `**Problem:** ${entry.problem || entry.summary || 'N/A'}`,
+            `**Problem:** ${entry.problem || 'N/A'}`,
             '',
-            `**Solution:** ${entry.solution || entry.fix || 'N/A'}`,
+            `**Root cause:** ${entry.root_cause || 'N/A'}`,
             '',
+            `**Solution:** ${entry.solution || 'N/A'}`,
+            '',
+            ...gotchasSection,
             `**Related:** ${relatedLinks}`,
             '',
             tags.map(t => `#${t.replace(/\s+/g, '-')}`).join(' '),
@@ -360,7 +458,6 @@ function writeKnowledge(analysis, writeDir, projectSlug) {
 
         const filename = `${dateStr}-${slug}.md`;
         writeFileSync(join(dir, filename), content);
-        existing.add(filename.toLowerCase());
     }
 }
 
@@ -384,7 +481,6 @@ function writeEssentials(analysis, writeDir, projectSlug) {
         const filepath = join(dir, filename);
         const dateStr = new Date().toISOString().slice(0, 10);
 
-        // Load existing entries
         let existing = {};
         if (existsSync(filepath)) {
             const content = readFileSync(filepath, 'utf8');
@@ -397,7 +493,6 @@ function writeEssentials(analysis, writeDir, projectSlug) {
             }
         }
 
-        // Merge
         for (const e of entries) {
             existing[e.key] = { category: e.category, value: e.value, context: e.context };
         }
@@ -407,6 +502,7 @@ function writeEssentials(analysis, writeDir, projectSlug) {
         const content = [
             '---',
             `date: ${dateStr}`,
+            `last_verified: ${dateStr}`,
             `tags: [essentials, ${scope}, ${categories.join(', ')}]`,
             '---',
             '',
@@ -428,49 +524,13 @@ function writeEssentials(analysis, writeDir, projectSlug) {
     }
 }
 
-// Diff summaries
-function writeDiffSummaries(analysis, buffer, writeDir, projectSlug) {
-    const summaries = analysis.diff_summaries || [];
-    if (summaries.length === 0) return;
-
-    const dateStr = new Date().toISOString().slice(0, 10);
-    const hostname = buffer[0]?.hostname || 'unknown';
-    const dir = join(writeDir, BASE, 'diff-summaries');
-    ensureDir(dir);
-
-    for (const ds of summaries) {
-        const cmd = ds.command || '';
-        const slug = cmd.replace(/^git\s+/, '').toLowerCase()
-            .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-
-        const content = [
-            '---',
-            `date: ${dateStr}`,
-            `machine: ${hostname}`,
-            `project: ${projectSlug}`,
-            `tags: [diff, ${projectSlug}]`,
-            '---',
-            '',
-            `# ${cmd.slice(0, 80)}`,
-            '',
-            `**Machine:** [[${hostname}]] | **Project:** [[${projectSlug}]]`,
-            '',
-            ...(ds.bullets || []).map(b => `- ${b}`),
-            '',
-        ].join('\n');
-
-        writeFileSync(join(dir, `${dateStr}-${slug}.md`), content);
-    }
-}
-
-// --- Hub notes: auto-generated project and machine pages ---
+// --- Hub notes ---
 
 function ensureProjectHub(writeDir, projectSlug) {
     const dir = join(writeDir, BASE, 'projects');
     ensureDir(dir);
     const filepath = join(dir, `${projectSlug}.md`);
 
-    // Only create if doesn't exist — user can customize these
     if (existsSync(filepath)) return;
 
     const content = [
@@ -480,17 +540,11 @@ function ensureProjectHub(writeDir, projectSlug) {
         '',
         `# ${projectSlug}`,
         '',
-        'This is an auto-generated project hub. All linked notes appear in the **backlinks panel** (right sidebar).',
+        'Auto-generated project hub. All linked notes appear in the **backlinks panel**.',
         '',
         '## Quick Links',
         '',
         `- [[${projectSlug}|Essentials & Credentials]]`,
-        '',
-        '## How to use',
-        '',
-        '- **Backlinks panel** (right sidebar): shows all sessions, knowledge entries, and essentials linked to this project',
-        '- **Graph view**: shows connections to machines, other projects, and knowledge',
-        '- **Search**: use the project name or tags to find related content',
         '',
         `#project #${projectSlug}`,
         '',
@@ -514,7 +568,7 @@ function ensureMachineHub(writeDir, hostname) {
         '',
         `# ${hostname}`,
         '',
-        'Auto-generated machine hub. All sessions, essentials, and knowledge linked to this machine appear in **backlinks**.',
+        'Auto-generated machine hub. All sessions and knowledge linked to this machine appear in **backlinks**.',
         '',
         `#machine #${safe}`,
         '',
@@ -527,7 +581,7 @@ function ensureMachineHub(writeDir, hostname) {
 
 function ensureDashboard(writeDir) {
     const filepath = join(writeDir, BASE, 'Dashboard.md');
-    if (existsSync(filepath)) return; // Don't overwrite user customizations
+    if (existsSync(filepath)) return;
 
     const content = [
         '---',
@@ -547,16 +601,11 @@ function ensureDashboard(writeDir) {
         '',
         '## Sessions',
         'Browse [[sessions/]] — daily logs grouped by machine.',
-         '',
-        '## Navigation Tips',
-        '- **Search** (Ctrl+Shift+F): search across all notes by keyword',
-        '- **Backlinks** (right sidebar): click any project/machine hub to see everything connected',
-        '- **Graph view** (Ctrl+G): visual map of all connections',
-        '- **Tags** (#essentials, #tier1, #tier2, #project-name, #machine-name): click to filter',
         '',
-        '## Hubs',
-        '- **Projects:** [[projects/]]',
-        '- **Machines:** [[machines/]]',
+        '## Navigation Tips',
+        '- **Search** (Ctrl+Shift+F): search across all notes',
+        '- **Backlinks** (right sidebar): click any project/machine hub to see connections',
+        '- **Graph view** (Ctrl+G): visual map of all connections',
         '',
     ].join('\n');
 
@@ -612,16 +661,24 @@ async function cleanupKB(writeDir) {
 // --- Main ---
 
 async function main() {
-    const buffer = readBuffer();
-    if (buffer.length === 0) return;
-
-    const projectSlug = getProjectSlug();
-    const hostname = buffer[0]?.hostname || 'unknown';
-    const writeDir = getWriteDir();
-
-    if (MODE === 'server') setupServerRepo();
+    if (!acquireLock()) {
+        logError('Lock file exists — another flush in progress, skipping');
+        return;
+    }
 
     try {
+        const buffer = readBuffer();
+        if (buffer.length === 0) { releaseLock(); return; }
+
+        const projectSlug = getProjectSlug();
+        const hostname = buffer[0]?.hostname || 'unknown';
+        const writeDir = getWriteDir();
+
+        if (MODE === 'server') setupServerRepo();
+
+        // Vault health check before writing
+        if (MODE === 'personal') vaultHealthCheck(writeDir);
+
         const analysis = await analyzeSession(buffer, projectSlug);
         if (!analysis) throw new Error('Failed to parse analysis from claude');
 
@@ -638,11 +695,10 @@ async function main() {
         if (analysis.should_log !== false) {
             const sessionResult = writeSession(analysis, buffer, writeDir, projectSlug);
             writeTimeLog(buffer, writeDir, projectSlug, sessionResult);
-            writeKnowledge(analysis, writeDir, projectSlug);
-            writeDiffSummaries(analysis, buffer, writeDir, projectSlug);
+            await writeKnowledge(analysis, writeDir, projectSlug);
         }
 
-        // Ensure hub notes exist for graph navigation
+        // Ensure hub notes exist
         ensureProjectHub(writeDir, projectSlug);
         ensureMachineHub(writeDir, hostname);
         ensureDashboard(writeDir);
@@ -655,14 +711,32 @@ async function main() {
         const dateStr = new Date().toISOString().slice(0, 10);
         await commitAndPush(writeDir, `log: ${dateStr} session (${TRIGGER})`);
         clearBuffer();
+
+        // Run maintenance (end-of-session, personal machine, 7-day cooldown)
+        if (TRIGGER === 'end-of-session' && MODE === 'personal') {
+            try {
+                const { fileURLToPath } = await import('url');
+                const { dirname } = await import('path');
+                const hooksDir = dirname(fileURLToPath(import.meta.url));
+                const maintenancePath = join(hooksDir, 'maintenance.mjs');
+                if (existsSync(maintenancePath)) {
+                    // Import and run maintenance inline (shares the same vault state)
+                    await import(maintenancePath);
+                }
+            } catch (err) {
+                logError(`Maintenance trigger failed: ${err.message}`);
+            }
+        }
     } catch (err) {
         logError(`Logger failed: ${err.message}`);
     } finally {
+        releaseLock();
         cleanupServer();
     }
 }
 
 main().catch(err => {
     logError(`Logger fatal: ${err.message}`);
+    releaseLock();
     process.exit(0);
 });
