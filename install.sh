@@ -80,6 +80,7 @@ HOOK_FILES=(
     "hooks/obsidian-kb-reader.mjs"
     "hooks/maintenance.mjs"
     "hooks/cc-search.sh"
+    "hooks/archive-vault.sh"
     "hooks/VERSION"
 )
 
@@ -94,6 +95,7 @@ chmod +x "$HOOKS_DIR/buffer-action.sh"
 chmod +x "$HOOKS_DIR/session-end.sh"
 chmod +x "$HOOKS_DIR/session-start.sh"
 chmod +x "$HOOKS_DIR/cc-search.sh"
+chmod +x "$HOOKS_DIR/archive-vault.sh"
 info "Shell scripts marked executable"
 
 # --- Personal mode: clone Claudelogs repo ---
@@ -106,7 +108,77 @@ if [ "$MODE" = "personal" ]; then
     else
         info "Claudelogs already cloned at $VAULT_PATH_EXPANDED"
     fi
-    # Ensure directory structure exists
+
+    # --- Vault health: fix stuck git state ---
+    if [ -d "$VAULT_PATH_EXPANDED/.git/rebase-merge" ] || [ -d "$VAULT_PATH_EXPANDED/.git/rebase-apply" ]; then
+        warn "Vault stuck in rebase — aborting"
+        git -C "$VAULT_PATH_EXPANDED" rebase --abort 2>/dev/null || true
+        info "Rebase aborted"
+    fi
+    if [ -f "$VAULT_PATH_EXPANDED/.git/MERGE_HEAD" ]; then
+        warn "Vault stuck in merge — aborting"
+        git -C "$VAULT_PATH_EXPANDED" merge --abort 2>/dev/null || true
+        info "Merge aborted"
+    fi
+
+    # Pull latest with merge strategy (never rebase)
+    git -C "$VAULT_PATH_EXPANDED" -c "credential.https://github.com.helper=" pull --no-rebase -X theirs 2>/dev/null || true
+
+    # --- Vault migration: archive old v2 data if present ---
+    # Detect old structure: knowledge-base/ dir or diff-summaries/ dir means pre-v3
+    NEEDS_ARCHIVE=false
+    [ -d "$VAULT_PATH_EXPANDED/claude-logs/knowledge-base" ] && NEEDS_ARCHIVE=true
+    [ -d "$VAULT_PATH_EXPANDED/claude-logs/diff-summaries" ] && NEEDS_ARCHIVE=true
+    [ -d "$VAULT_PATH_EXPANDED/claude-logs/dev-logs" ] && NEEDS_ARCHIVE=true
+
+    # Also check for empty orphan .md files in vault root (v2 artifact)
+    ORPHAN_COUNT=0
+    for f in "$VAULT_PATH_EXPANDED"/*.md; do
+        [ -f "$f" ] || continue
+        [ ! -s "$f" ] && ORPHAN_COUNT=$((ORPHAN_COUNT + 1))
+    done
+    [ "$ORPHAN_COUNT" -gt 3 ] && NEEDS_ARCHIVE=true
+
+    if [ "$NEEDS_ARCHIVE" = true ]; then
+        warn "Detected old v2 vault structure — archiving"
+        DATE=$(date +%Y-%m-%d)
+        ARCHIVE_DIR="$VAULT_PATH_EXPANDED/claude-logs/archive/v2-${DATE}"
+        mkdir -p "$ARCHIVE_DIR"
+
+        # Delete empty orphan files in vault root
+        for f in "$VAULT_PATH_EXPANDED"/*.md; do
+            [ -f "$f" ] || continue
+            [ ! -s "$f" ] && rm -f "$f"
+        done
+
+        # Archive legacy dirs
+        for legacy in knowledge-base diff-summaries dev-logs; do
+            if [ -d "$VAULT_PATH_EXPANDED/claude-logs/$legacy" ]; then
+                mv "$VAULT_PATH_EXPANDED/claude-logs/$legacy" "$ARCHIVE_DIR/" 2>/dev/null || true
+            fi
+        done
+
+        # Move existing content dirs into archive (except archive/ itself)
+        for dir in knowledge sessions essentials time-log projects machines; do
+            srcdir="$VAULT_PATH_EXPANDED/claude-logs/$dir"
+            if [ -d "$srcdir" ] && [ -n "$(ls -A "$srcdir" 2>/dev/null)" ]; then
+                mkdir -p "$ARCHIVE_DIR/$dir"
+                mv "$srcdir"/* "$ARCHIVE_DIR/$dir/" 2>/dev/null || true
+            fi
+        done
+
+        # Commit the archive
+        git -C "$VAULT_PATH_EXPANDED" add -A
+        if git -C "$VAULT_PATH_EXPANDED" status --porcelain | grep -q .; then
+            git -C "$VAULT_PATH_EXPANDED" -c commit.gpgsign=false \
+                commit -m "archive: auto-migrate to v3 structure (${DATE})" 2>/dev/null || true
+            git -C "$VAULT_PATH_EXPANDED" -c "credential.https://github.com.helper=" push 2>/dev/null || \
+                warn "Archive push failed — will retry on next session"
+        fi
+        info "Archived old vault data to claude-logs/archive/v2-${DATE}"
+    fi
+
+    # Ensure clean v3 directory structure exists
     mkdir -p "$VAULT_PATH_EXPANDED/claude-logs"/{knowledge,sessions,projects,machines,essentials,time-log}
 fi
 
